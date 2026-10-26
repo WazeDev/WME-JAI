@@ -5,7 +5,7 @@
 // @match         *://*.waze.com/*editor*
 // @exclude       *://*.waze.com/user/editor*
 // @exclude       *://*.waze.com/editor/sdk/*
-// @version       4.0.0
+// @version       4.0.1
 // @grant         GM_xmlhttpRequest
 // @grant         GM_info
 // @connect       greasyfork.org
@@ -66,7 +66,7 @@
 
   // ── Debug & execution state ───────────────────────────────────────────────
   // Runtime flags and counters used across the module.
-  var junctionangle_debug = 2; // 0=off, 1=errors+warnings, 2=key decisions (function outcomes), 3=per-segment detail, 4=object dumps+internals — lower to 1 before release
+  var junctionangle_debug = 1; // 0=off, 1=errors+warnings, 2=key decisions (function outcomes), 3=per-segment detail, 4=object dumps+internals — lower to 1 before release
   var ja_last_restart = 0; // epoch ms timestamp — throttles auto-restart on stale data errors
   var sdk; // WME SDK instance, assigned by bootstrap()
 

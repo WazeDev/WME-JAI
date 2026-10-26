@@ -5,7 +5,7 @@
 // @match         *://*.waze.com/*editor*
 // @exclude       *://*.waze.com/user/editor*
 // @exclude       *://*.waze.com/editor/sdk/*
-// @version       3.3.1
+// @version       4.0.0
 // @grant         GM_xmlhttpRequest
 // @grant         GM_info
 // @connect       greasyfork.org
@@ -45,7 +45,8 @@
  *  2026 "JS55CT"                    V3.0.0 Current maintainer; SDK migration,
  *                                   V3.1.0 - 3.1.5 RoundAbout support, JB and Paths
  *                                   V3.2.0  Added Continuous scanning for problem angles
- *  *                                V3.3.0  Live Edit angle caculations
+ *                                   V3.3.0  Live Edit angle caculations
+ *  *                                V4.0.0  Updated to use WME SDK async
  */
 
 /*global I18n, $, bootstrap, turf, getWmeSdk, SDK_INITIALIZED, GM_info, GM_xmlhttpRequest*/
@@ -58,17 +59,14 @@
   // **************************************************************************************************************
   const SHOW_UPDATE_MESSAGE = true;
   const SCRIPT_VERSION_CHANGES = [
-    'Version 3.3.0:',
-    'Implement real-time marker updates during segment dragging',
-    'Experimental features released as "Advanced" options',
-    'Version 3.3.1: Small UI fix',
+    'Updated to use WME SDK async',
   ];
   const SCRIPT_VERSION = GM_info.script.version.toString();
   const DOWNLOAD_URL = 'https://update.greasyfork.org/scripts/35547/WME%20Junction%20Angle%20Info.user.js';
 
   // ── Debug & execution state ───────────────────────────────────────────────
   // Runtime flags and counters used across the module.
-  var junctionangle_debug = 1; // 0=off, 1=errors+warnings, 2=key decisions (function outcomes), 3=per-segment detail, 4=object dumps+internals — lower to 1 before release
+  var junctionangle_debug = 2; // 0=off, 1=errors+warnings, 2=key decisions (function outcomes), 3=per-segment detail, 4=object dumps+internals — lower to 1 before release
   var ja_last_restart = 0; // epoch ms timestamp — throttles auto-restart on stale data errors
   var sdk; // WME SDK instance, assigned by bootstrap()
 
@@ -286,8 +284,8 @@
    *
    * @returns {Array<{id: number, type: string}>} Selected segments/nodes, or [] if none.
    */
-  function getselfeat() {
-    var sel = sdk.Editing.getSelection();
+  async function getselfeat() {
+    var sel = await sdk.Editing.getSelection();
     if (!sel) {
       return [];
     }
@@ -306,8 +304,8 @@
    *
    * @returns {boolean} True if the selection is non-empty.
    */
-  function hasSelection() {
-    return getselfeat().length > 0;
+  async function hasSelection() {
+    return (await getselfeat()).length > 0;
   }
 
   /**
@@ -320,8 +318,8 @@
    * @param {number} segmentId - The segment ID to test.
    * @returns {boolean} True if the segment is part of the current selection.
    */
-  function ja_is_segment_selected(segmentId) {
-    var sel = sdk.Editing.getSelection();
+  async function ja_is_segment_selected(segmentId) {
+    var sel = await sdk.Editing.getSelection();
     return sel != null && sel.objectType === 'segment' && sel.ids.indexOf(segmentId) !== -1;
   }
 
@@ -335,9 +333,9 @@
    *
    * @returns {number} Base label distance in meters.
    */
-  function ja_compute_label_distance() {
+  async function ja_compute_label_distance() {
     var ja_label_distance;
-    switch (sdk.Map.getZoomLevel()) {
+    switch (await sdk.Map.getZoomLevel()) {
       case 22:
         ja_label_distance = 1.2;
         break;
@@ -369,10 +367,10 @@
         ja_label_distance = 300;
         break;
       default:
-        ja_log('Unsupported zoom level: ' + sdk.Map.getZoomLevel() + '!', 1);
+        ja_log('Unsupported zoom level: ' + await sdk.Map.getZoomLevel() + '!', 1);
     }
     ja_label_distance *= 1 + 0.2 * parseInt(ja_getOption('decimals'));
-    ja_log('zoom: ' + sdk.Map.getZoomLevel() + ' -> distance: ' + ja_label_distance, 3);
+    ja_log('zoom: ' + await sdk.Map.getZoomLevel() + ' -> distance: ' + ja_label_distance, 3);
     return ja_label_distance;
   }
 
@@ -389,22 +387,22 @@
    * @param {number[]} ja_nodes - Array of node IDs from the current selection.
    * @returns {Object} Map of junctionId → { in_s, in_n, out_s, out_n, p }.
    */
-  function ja_find_roundabouts(ja_nodes) {
+  async function ja_find_roundabouts(ja_nodes) {
     var ja_selected_roundabouts = {};
-    ja_nodes.forEach(function (node) {
-      var nodeObj = sdk.DataModel.Nodes.getById({ nodeId: node });
+    for (const node of ja_nodes) {
+      let nodeObj = await sdk.DataModel.Nodes.getById({ nodeId: node });
       ja_log(nodeObj, 3);
 
-      var tmp_s = null,
+      let tmp_s = null,
         tmp_n = null,
         tmp_junctionID = null;
       if (nodeObj == null || typeof nodeObj.connectedSegmentIds === 'undefined') {
-        return;
+        continue;
       }
-      nodeObj.connectedSegmentIds.forEach(function (segment) {
+      for (const segment of (nodeObj.connectedSegmentIds)) {
         ja_log(segment, 3);
 
-        var segObj = sdk.DataModel.Segments.getById({ segmentId: segment });
+        let segObj = await sdk.DataModel.Segments.getById({ segmentId: segment });
         if (segObj != null && segObj.junctionId != null) {
           ja_log('Roundabout detected: ' + segObj.junctionId, 3);
           tmp_junctionID = segObj.junctionId;
@@ -413,16 +411,16 @@
           tmp_n = node;
         }
         ja_log('tmp_s: ' + (tmp_s === null ? 'null' : tmp_s), 3);
-      });
+      };
       ja_log('final tmp_s: ' + (tmp_s === null ? 'null' : tmp_s), 3);
       if (tmp_junctionID === null) {
-        return;
+        continue;
       }
       if (ja_selected_roundabouts.hasOwnProperty(tmp_junctionID)) {
         ja_selected_roundabouts[tmp_junctionID].out_s = tmp_s;
         ja_selected_roundabouts[tmp_junctionID].out_n = node;
       } else {
-        var tmp_junction = sdk.DataModel.Junctions.getById({ junctionId: tmp_junctionID });
+        let tmp_junction = await sdk.DataModel.Junctions.getById({ junctionId: tmp_junctionID });
         ja_selected_roundabouts[tmp_junctionID] = {
           in_s: tmp_s,
           in_n: tmp_n,
@@ -431,7 +429,7 @@
           p: tmp_junction ? tmp_junction.geometry : undefined,
         };
       }
-    });
+    };
     return ja_selected_roundabouts;
   }
 
@@ -448,7 +446,7 @@
    * @param {Object} ja_selected_roundabouts - Map from ja_find_roundabouts().
    * @param {number} ja_label_distance - Base marker offset distance in meters.
    */
-  function ja_draw_roundabout_markers(ja_selected_roundabouts, ja_label_distance) {
+  async function ja_draw_roundabout_markers(ja_selected_roundabouts, ja_label_distance) {
     //Do some fancy painting for the roundabouts...
     for (var tmp_roundabout in ja_selected_roundabouts) {
       if (ja_selected_roundabouts.hasOwnProperty(tmp_roundabout)) {
@@ -463,45 +461,45 @@
         }
         // Entry-only selection (no exit node in selection): show all exits relative to entry
         if (ja_selected_roundabouts[tmp_roundabout].out_n === null) {
-          ja_draw_roundabout_entry_exits(tmp_roundabout_id, ja_selected_roundabouts[tmp_roundabout].in_n, ja_label_distance);
+          await ja_draw_roundabout_entry_exits(tmp_roundabout_id, ja_selected_roundabouts[tmp_roundabout].in_n, ja_label_distance);
           continue;
         }
 
         // Roundabout arc selected: use the segment's entry node based on direction of travel.
         // Show all exits from that entry — same view as selecting an entry segment connected at that node.
-        var _selfeat = getselfeat();
+        var _selfeat = await getselfeat();
         if (_selfeat.length === 1 && _selfeat[0].type === 'segment') {
-          var _selSeg = sdk.DataModel.Segments.getById({ segmentId: _selfeat[0].id });
+          var _selSeg = await sdk.DataModel.Segments.getById({ segmentId: _selfeat[0].id });
           if (_selSeg && _selSeg.junctionId !== null) {
             // Determine entry node based on direction of travel (not geometric direction)
             // isAtoB means traffic flows from fromNodeId to toNodeId; isBtoA means toNodeId to fromNodeId
             var entryNodeForRA = _selSeg.isAtoB ? _selSeg.fromNodeId : _selSeg.toNodeId;
             ja_log('[RA] Selected RA arc: isAtoB=' + _selSeg.isAtoB + ', isBtoA=' + _selSeg.isBtoA + ', entry node=' + entryNodeForRA, 2);
-            ja_draw_roundabout_entry_exits(tmp_roundabout_id, entryNodeForRA, ja_label_distance);
+            await ja_draw_roundabout_entry_exits(tmp_roundabout_id, entryNodeForRA, ja_label_distance);
             continue;
           }
         }
 
         //Draw circle overlay for this roundabout
         if (ja_getOption('roundaboutOverlayDisplay') === 'rOverSelected') {
-          ja_draw_roundabout_overlay(tmp_roundabout_id);
+          await ja_draw_roundabout_overlay(tmp_roundabout_id);
         }
 
         //Transform LonLat to actual layer projection
         var tmp_roundabout_center = ja_coordinates_to_point(ja_selected_roundabouts[tmp_roundabout].p.coordinates);
-        var tmp_in_geom = sdk.DataModel.Nodes.getById({ nodeId: ja_selected_roundabouts[tmp_roundabout].in_n }).geometry;
-        var tmp_out_geom = sdk.DataModel.Nodes.getById({ nodeId: ja_selected_roundabouts[tmp_roundabout].out_n }).geometry;
+        var tmp_in_geom = (await sdk.DataModel.Nodes.getById({ nodeId: ja_selected_roundabouts[tmp_roundabout].in_n })).geometry;
+        var tmp_out_geom = (await sdk.DataModel.Nodes.getById({ nodeId: ja_selected_roundabouts[tmp_roundabout].out_n })).geometry;
         var angle = ja_angle_between_points(tmp_in_geom, tmp_roundabout_center, tmp_out_geom);
 
         //Draw the two legs of the triangle (in_n → center → out_n)
-        ja_add_feature({ type: 'LineString', coordinates: [tmp_in_geom.coordinates, tmp_roundabout_center.coordinates, tmp_out_geom.coordinates] }, { ja_type: 'arrow_line' });
+        await ja_add_feature({ type: 'LineString', coordinates: [tmp_in_geom.coordinates, tmp_roundabout_center.coordinates, tmp_out_geom.coordinates] }, { ja_type: 'arrow_line' });
         // Call ja_is_roundabout_normal for its side effect: places ±N° deviation markers
         // at any exit node that is more than 15° off perpendicular.
-        ja_is_roundabout_normal(tmp_roundabout_id, ja_selected_roundabouts[tmp_roundabout].in_n, ja_label_distance);
+        await ja_is_roundabout_normal(tmp_roundabout_id, ja_selected_roundabouts[tmp_roundabout].in_n, ja_label_distance);
         // Color the center marker based on THIS specific path's angle only.
         // Per Waze: a roundabout can be normal for one entry and non-normal for another.
         var ra_path_is_normal = ja_is_angle_normal(angle);
-        ja_add_feature(tmp_roundabout_center, {
+        await ja_add_feature(tmp_roundabout_center, {
           angle: ja_round(angle) + '°',
           ja_type: ra_path_is_normal ? ja_routing_type.BC : ja_routing_type.ROUNDABOUT,
         });
@@ -526,7 +524,7 @@
    * @param {number[]} ja_nodes - Array of selected node IDs.
    * @returns {{data: Object, collect: Function, forEachItem: Function}} Accumulator.
    */
-  function ja_collect_double_turns(ja_nodes, allBigJunctions) {
+  async function ja_collect_double_turns(ja_nodes, allBigJunctions) {
     /**
      * Collect double-turn (inc. U-turn) segments info
      */
@@ -562,61 +560,61 @@
 
     //Loop through segments <=30 m (always qualifies) or 31-49 m with lane guidance on the incoming segment
     if (ja_getOption('angleMode') === 'aDeparture' && ja_nodes.length > 1) {
-      getselfeat().forEach(function (selectedSegment) {
-        var segmentId = selectedSegment.id;
-        var segment = sdk.DataModel.Segments.getById({ segmentId: segmentId });
+      for (const selectedSegment of (await getselfeat())) {
+        let segmentId = selectedSegment.id;
+        let segment = await sdk.DataModel.Segments.getById({ segmentId: segmentId });
         ja_log('Checking ' + segmentId + ' for double turns ...', 3);
 
-        var len = ja_segment_length(segment);
+        let len = ja_segment_length(segment);
         ja_log('Segment ' + segmentId + ' length: ' + len, 3);
-        if (!ja_is_uturn_qualifying_road(segment)) return;
+        if (!ja_is_uturn_qualifying_road(segment)) continue;
 
         // SUPPRESS LOCAL DOUBLE U-TURNS FOR ENTRY SEGMENTS CROSSING INTO JB
         // When a segment crosses INTO a JB (one endpoint outside, one inside),
         // JB far-turn logic (with U-TURN instructions) takes over. Local double-turn
         // markers would duplicate the JB U-TURN marker.
-        var bjCrossing = ja_segment_crosses_bj_boundary(segment, allBigJunctions);
+        let bjCrossing = ja_segment_crosses_bj_boundary(segment, allBigJunctions);
         if (bjCrossing.crosses) {
           ja_log('Skip double turns: ' + segmentId + ' crosses JB boundary', 3);
-          return; // Skip double-turn collection for this entry-to-JB segment
+          continue; // Skip double-turn collection for this entry-to-JB segment
         }
 
-        var fromNode = sdk.DataModel.Nodes.getById({ nodeId: segment.fromNodeId });
-        var toNode = sdk.DataModel.Nodes.getById({ nodeId: segment.toNodeId });
+        let fromNode = await sdk.DataModel.Nodes.getById({ nodeId: segment.fromNodeId });
+        let toNode = await sdk.DataModel.Nodes.getById({ nodeId: segment.toNodeId });
 
-        var lenRounded = Math.round(len);
+        let lenRounded = Math.round(len);
         if (lenRounded <= 49) {
-          var a_from = ja_getAngleMidleSeg(segment.fromNodeId, segment);
-          var a_to = ja_getAngleMidleSeg(segment.toNodeId, segment);
+          let a_from = ja_getAngleMidleSeg(segment.fromNodeId, segment);
+          let a_to = ja_getAngleMidleSeg(segment.toNodeId, segment);
 
-          fromNode.connectedSegmentIds.forEach(function (fromSegmentId) {
-            if (fromSegmentId === segmentId) return;
-            var fromSegment = sdk.DataModel.Segments.getById({ segmentId: fromSegmentId });
-            if (!ja_is_uturn_qualifying_road(fromSegment)) return;
-            var from_a = ja_getAngle(segment.fromNodeId, fromSegment);
-            var from_angle = ja_angle_diff(from_a, a_from, false);
+          for (const fromSegmentId of (fromNode.connectedSegmentIds)) {
+            if (fromSegmentId === segmentId) continue;
+            let fromSegment = await sdk.DataModel.Segments.getById({ segmentId: fromSegmentId });
+            if (!ja_is_uturn_qualifying_road(fromSegment)) continue;
+            let from_a = ja_getAngle(segment.fromNodeId, fromSegment);
+            let from_angle = ja_angle_diff(from_a, a_from, false);
             ja_log('Segment from ' + fromSegmentId + ' angle: ' + from_a + ', turn angle: ' + from_angle, 3);
 
-            toNode.connectedSegmentIds.forEach(function (toSegmentId) {
-              if (toSegmentId === segmentId) return;
-              var toSegment = sdk.DataModel.Segments.getById({ segmentId: toSegmentId });
-              if (!ja_is_uturn_qualifying_road(toSegment)) return;
-              var to_a = ja_getAngle(segment.toNodeId, toSegment);
-              var to_angle = ja_angle_diff(to_a, a_to, false);
+            for (const toSegmentId of (toNode.connectedSegmentIds)) {
+              if (toSegmentId === segmentId) continue;
+              let toSegment = await sdk.DataModel.Segments.getById({ segmentId: toSegmentId });
+              if (!ja_is_uturn_qualifying_road(toSegment)) continue;
+              let to_a = ja_getAngle(segment.toNodeId, toSegment);
+              let to_angle = ja_angle_diff(to_a, a_to, false);
               ja_log('Segment to ' + toSegmentId + ' angle: ' + to_a + ', turn angle: ' + to_angle, 3);
 
-              var angle = Math.abs(to_angle - from_angle);
+              let angle = Math.abs(to_angle - from_angle);
               ja_log('Angle from ' + fromSegmentId + ' to ' + toSegmentId + ' is: ' + angle, 3);
 
               // Path 1: fromSegment → segment → toSegment (A → B → C)
-              var hasLGFromToMedian = ja_segment_has_lane_guidance(fromSegmentId, fromNode.id, segmentId);
-              var turn_type_path1 = ja_classify_uturn_angle(angle, lenRounded, fromSegment, toSegment, fromNode.id, toNode.id, hasLGFromToMedian);
+              let hasLGFromToMedian = await ja_segment_has_lane_guidance(fromSegmentId, fromNode.id, segmentId);
+              let turn_type_path1 = ja_classify_uturn_angle(angle, lenRounded, fromSegment, toSegment, fromNode.id, toNode.id, hasLGFromToMedian);
 
               if (turn_type_path1 !== null) {
                 var useWazeRestriction = turn_type_path1 === ja_routing_type.NO_U_TURN;
 
                 // Collect if turns are allowed (same logic for both paths)
-                if (ja_is_turn_allowed(fromSegment, fromNode, segment) && ja_is_turn_allowed(segment, toNode, toSegment)) {
+                if (await ja_is_turn_allowed(fromSegment, fromNode, segment) && await ja_is_turn_allowed(segment, toNode, toSegment)) {
                   // When Waze restriction applies, always collect; otherwise check length/lane guidance
                   if (useWazeRestriction || lenRounded <= 30 || hasLGFromToMedian) {
                     doubleTurns.collect(segmentId, fromSegmentId, toSegmentId, angle, turn_type_path1);
@@ -625,78 +623,78 @@
               }
 
               // Path 2: toSegment → segment → fromSegment (C → B → A)
-              var hasLGToToMedian = ja_segment_has_lane_guidance(toSegmentId, toNode.id, segmentId);
-              var turn_type_path2 = ja_classify_uturn_angle(angle, lenRounded, toSegment, fromSegment, toNode.id, fromNode.id, hasLGToToMedian);
+              let hasLGToToMedian = await ja_segment_has_lane_guidance(toSegmentId, toNode.id, segmentId);
+              let turn_type_path2 = ja_classify_uturn_angle(angle, lenRounded, toSegment, fromSegment, toNode.id, fromNode.id, hasLGToToMedian);
 
               if (turn_type_path2 !== null) {
                 useWazeRestriction = turn_type_path2 === ja_routing_type.NO_U_TURN;
 
-                if (ja_is_turn_allowed(toSegment, toNode, segment) && ja_is_turn_allowed(segment, fromNode, fromSegment)) {
+                if (await ja_is_turn_allowed(toSegment, toNode, segment) && await ja_is_turn_allowed(segment, fromNode, fromSegment)) {
                   // When Waze restriction applies, always collect; otherwise check length/lane guidance
                   if (useWazeRestriction || lenRounded <= 30 || hasLGToToMedian) {
                     doubleTurns.collect(segmentId, toSegmentId, fromSegmentId, angle, turn_type_path2);
                   }
                 }
               }
-            });
-          });
+            };
+          };
         }
-      });
+      };
 
       // Second pass: trigger double-turn detection when an entry/exit arm is selected.
       // For each selected segment, look at its endpoint nodes for qualifying median neighbors.
       // Skips any neighbor that is itself a selected segment (already handled by first loop).
       var selectedIds = {};
-      getselfeat().forEach(function (s) {
+      (await getselfeat()).forEach(function (s) {
         selectedIds[s.id] = true;
       });
 
-      getselfeat().forEach(function (selectedSegment) {
-        var armId = selectedSegment.id;
-        var armSeg = sdk.DataModel.Segments.getById({ segmentId: armId });
-        if (!ja_is_uturn_qualifying_road(armSeg)) return;
+      for (const selectedSegment of (await getselfeat())) {
+        let armId = selectedSegment.id;
+        let armSeg = await sdk.DataModel.Segments.getById({ segmentId: armId });
+        if (!ja_is_uturn_qualifying_road(armSeg)) continue;
 
         // SUPPRESS LOCAL DOUBLE U-TURNS FOR ARM SEGMENTS CROSSING INTO JB
-        var armBjCrossing = ja_segment_crosses_bj_boundary(armSeg, allBigJunctions);
+        let armBjCrossing = ja_segment_crosses_bj_boundary(armSeg, allBigJunctions);
         if (armBjCrossing.crosses) {
           ja_log('Skip arm double turns: ' + armId + ' crosses JB boundary', 3);
-          return;
+          continue;
         }
 
-        [armSeg.fromNodeId, armSeg.toNodeId].forEach(function (armNodeId) {
-          var armNode = sdk.DataModel.Nodes.getById({ nodeId: armNodeId });
+        for (const armNodeId of ([armSeg.fromNodeId, armSeg.toNodeId])) {
+          let armNode = await sdk.DataModel.Nodes.getById({ nodeId: armNodeId });
 
-          armNode.connectedSegmentIds.forEach(function (neighborId) {
-            if (neighborId === armId) return;
-            if (selectedIds[neighborId]) return; // already handled as direct median selection
+          for (const neighborId of (armNode.connectedSegmentIds)) {
+            if (neighborId === armId) continue;
+            if (selectedIds[neighborId]) continue; // already handled as direct median selection
 
-            var neighbor = sdk.DataModel.Segments.getById({ segmentId: neighborId });
-            if (!ja_is_uturn_qualifying_road(neighbor)) return;
-            var nLen = Math.round(ja_segment_length(neighbor));
-            if (nLen > 49) return;
-            if (nLen > 30 && !ja_segment_has_lane_guidance(armId, armNodeId, neighborId)) return;
-            if (!ja_is_turn_allowed(armSeg, armNode, neighbor)) return;
+            let neighbor = await sdk.DataModel.Segments.getById({ segmentId: neighborId });
+            if (!ja_is_uturn_qualifying_road(neighbor)) continue;
+            let nLen = Math.round(ja_segment_length(neighbor));
+            if (nLen > 49) continue;
+            if (nLen > 30 && !await ja_segment_has_lane_guidance(armId, armNodeId, neighborId)) continue;
+            if (!await ja_is_turn_allowed(armSeg, armNode, neighbor)) continue;
 
-            var a_arm_side = ja_getAngleMidleSeg(armNodeId, neighbor);
-            var medianFarNodeId = neighbor.fromNodeId === armNodeId ? neighbor.toNodeId : neighbor.fromNodeId;
-            var a_exit_side = ja_getAngleMidleSeg(medianFarNodeId, neighbor);
-            var medianFarNode = sdk.DataModel.Nodes.getById({ nodeId: medianFarNodeId });
+            let a_arm_side = ja_getAngleMidleSeg(armNodeId, neighbor);
+            let medianFarNodeId = neighbor.fromNodeId === armNodeId ? neighbor.toNodeId : neighbor.fromNodeId;
+            let a_exit_side = ja_getAngleMidleSeg(medianFarNodeId, neighbor);
+            let medianFarNode = await sdk.DataModel.Nodes.getById({ nodeId: medianFarNodeId });
 
-            var arm_a = ja_getAngle(armNodeId, armSeg);
-            var arm_angle = ja_angle_diff(arm_a, a_arm_side, false);
+            let arm_a = ja_getAngle(armNodeId, armSeg);
+            let arm_angle = ja_angle_diff(arm_a, a_arm_side, false);
 
-            medianFarNode.connectedSegmentIds.forEach(function (exitId) {
-              if (exitId === neighborId) return;
-              var exitSeg = sdk.DataModel.Segments.getById({ segmentId: exitId });
-              if (!ja_is_uturn_qualifying_road(exitSeg)) return;
-              if (!ja_is_turn_allowed(neighbor, medianFarNode, exitSeg)) return;
+            for (const exitId of (medianFarNode.connectedSegmentIds)) {
+              if (exitId === neighborId) continue;
+              let exitSeg = await sdk.DataModel.Segments.getById({ segmentId: exitId });
+              if (!ja_is_uturn_qualifying_road(exitSeg)) continue;
+              if (!await ja_is_turn_allowed(neighbor, medianFarNode, exitSeg)) continue;
 
-              var exit_a = ja_getAngle(medianFarNodeId, exitSeg);
-              var exit_angle = ja_angle_diff(exit_a, a_exit_side, false);
-              var combined_angle = Math.abs(exit_angle - arm_angle);
+              let exit_a = ja_getAngle(medianFarNodeId, exitSeg);
+              let exit_angle = ja_angle_diff(exit_a, a_exit_side, false);
+              let combined_angle = Math.abs(exit_angle - arm_angle);
               ja_log('Entry-arm trigger: ' + armId + ' -> ' + neighborId + ' -> ' + exitId + ' angle: ' + combined_angle, 3);
 
-              var turn_type = ja_classify_uturn_angle(combined_angle, nLen, armSeg, exitSeg, armNodeId, medianFarNodeId);
+              let turn_type = ja_classify_uturn_angle(combined_angle, nLen, armSeg, exitSeg, armNodeId, medianFarNodeId);
               if (turn_type !== null) {
                 doubleTurns.farExitMarkers.push({
                   farNodeId: medianFarNodeId,
@@ -705,10 +703,10 @@
                   turn_type: turn_type,
                 });
               }
-            });
-          });
-        });
-      });
+            };
+          };
+        };
+      };
     }
 
     ja_log('Double-turns collected: ' + doubleTurns.data.length + ' total', 3);
@@ -739,11 +737,11 @@
    *   When true, far-turn (Path/JB) markers are suppressed — show only the node's absolute angles.
    * @returns {boolean} True if a data error occurred and the calculation must be retried.
    */
-  function ja_draw_node_markers(ja_nodes, ja_label_distance, doubleTurns, ja_selected_has_median, ja_selected_seg_ids, allBigJunctions, ja_is_pure_node_selection) {
+  async function ja_draw_node_markers(ja_nodes, ja_label_distance, doubleTurns, ja_selected_has_median, ja_selected_seg_ids, allBigJunctions, ja_is_pure_node_selection) {
     var restart = false;
     //Start looping through selected nodes
     for (var i = 0; i < ja_nodes.length; i++) {
-      var node = sdk.DataModel.Nodes.getById({ nodeId: ja_nodes[i] });
+      var node = await sdk.DataModel.Nodes.getById({ nodeId: ja_nodes[i] });
       var angles = [];
       var ja_selected_segments_count = 0;
       var ja_selected_angles = [];
@@ -769,8 +767,8 @@
       ja_log('Calculating angles for ' + ja_current_node_segments.length + ' segments', 3);
       ja_log(ja_current_node_segments, 4);
 
-      ja_current_node_segments.forEach(function (nodeSegment, j) {
-        var s = sdk.DataModel.Segments.getById({ segmentId: nodeSegment });
+      for (const [j, nodeSegment] of ja_current_node_segments.entries()) {
+        let s = await sdk.DataModel.Segments.getById({ segmentId: nodeSegment });
 
         // During drag polling: if this is the selected segment and we have live SVG coordinates,
         // patch the segment object with the live geometry instead of the stale data model
@@ -795,11 +793,11 @@
         }
         a = ja_getAngle(ja_nodes[i], s);
         ja_log('Segment ' + nodeSegment + ' angle: ' + a, 4);
-        angles[j] = [a, nodeSegment, s == null ? false : ja_is_segment_selected(nodeSegment)];
-        if (s == null ? false : ja_is_segment_selected(nodeSegment)) {
+        angles[j] = [a, nodeSegment, s == null ? false : await ja_is_segment_selected(nodeSegment)];
+        if (s == null ? false : await ja_is_segment_selected(nodeSegment)) {
           ja_selected_segments_count++;
         }
-      });
+      };
 
       if (restart) {
         return true;
@@ -807,7 +805,7 @@
 
       //make sure we have the selected angles in correct order
       ja_log(ja_current_node_segments, 4);
-      getselfeat().forEach(function (selectedSegment) {
+      (await getselfeat()).forEach(function (selectedSegment) {
         var selectedSegmentId = selectedSegment.id;
         if (ja_current_node_segments.indexOf(selectedSegmentId) >= 0) {
           //find the angle
@@ -848,12 +846,12 @@
           ja_log(angles, 4);
           var s_in_seg = ja_selected_angles[0][1];
           var s_out_seg = ja_selected_angles[1][1];
-          ja_junction_type = ja_guess_routing_instruction(node, s_in_seg, s_out_seg, angles);
+          ja_junction_type = await ja_guess_routing_instruction(node, s_in_seg, s_out_seg, angles);
           ja_log('Guess result: ' + s_in_seg + ' → ' + s_out_seg + ' = ' + ja_junction_type, 2);
         }
         //get the initial marker point
         point = turf.destination(turf.point(node.geometry.coordinates), (ja_extra_space_multiplier * ja_ld) / 1000, ja_math_to_compass(ha)).geometry;
-        ja_draw_marker(point, node, ja_ld, a, ha, true, ja_junction_type);
+        await ja_draw_marker(point, node, ja_ld, a, ha, true, ja_junction_type);
 
         // Record this local marker for far-turn conflict detection
         // (Far-turn markers drawn later will check this data and adjust their distance if needed)
@@ -865,14 +863,14 @@
         //draw double turn markers
         // If there are double-turn markers at this node+bearing, offset them farther out
         var doubleTurnMultiplier = ja_extra_space_multiplier;
-        doubleTurns.forEachItem(ja_selected_angles[0][1], ja_selected_angles[1][1], function (item) {
+        doubleTurns.forEachItem(ja_selected_angles[0][1], ja_selected_angles[1][1], async function (item) {
           if (doubleTurnMultiplier === ja_extra_space_multiplier) {
             // First double-turn found: use larger distance to separate from local marker
             doubleTurnMultiplier = ja_extra_space_multiplier * 1.4;
             ja_log('[DOUBLE-TURN] Offset double-turn markers at node ' + node.id + ' by 1.4x', 2);
           }
           var doubleTurnPoint = turf.destination(turf.point(node.geometry.coordinates), (doubleTurnMultiplier * ja_ld) / 1000, ja_math_to_compass(ha)).geometry;
-          ja_draw_marker(doubleTurnPoint, node, ja_ld, item.angle, ha, true, item.turn_type);
+          await ja_draw_marker(doubleTurnPoint, node, ja_ld, item.angle, ha, true, item.turn_type);
         });
       } else {
         //sort angle data (ascending)
@@ -883,10 +881,10 @@
         ja_log(ja_selected_segments_count, 4);
 
         //get all segment angles
-        angles.forEach(function (angle, j) {
+        for (const [j, angle] of angles.entries()) {
           a = (360 + (angles[(j + 1) % angles.length][0] - angle[0])) % 360;
           ha = (360 + (a / 2 + angle[0])) % 360;
-          var a_in = angles.filter(function (a) {
+          let a_in = angles.filter(function (a) {
             return !!a[2];
           })[0];
 
@@ -894,16 +892,16 @@
           // (not on both sides). Skipping the one > 180
           if (ja_selected_segments_count === 1 && angles.length === 2 && a >= 180 && ja_getOption('angleMode') !== 'aDeparture') {
             ja_log('Skipping marker, as we need only one of them', 3);
-            return;
+            continue;
           }
           if (ja_getOption('angleMode') === 'aDeparture' && ja_selected_segments_count > 0) {
             if (a_in[1] === angle[1]) {
               ja_log('in == out. skipping.', 3);
-              return;
+              continue;
             }
             ja_log('Angle in:', 3);
             ja_log(a_in, 4);
-            var depMarkerType = ja_getOption('guess') ? ja_guess_routing_instruction(node, a_in[1], angle[1], angles) : ja_routing_type.TURN;
+            let depMarkerType = ja_getOption('guess') ? await ja_guess_routing_instruction(node, a_in[1], angle[1], angles) : ja_routing_type.TURN;
             ja_log('Guess result: ' + a_in[1] + ' → ' + angle[1] + ' = ' + depMarkerType, 3);
 
             //FIXME: we might want to try to keep the marker on the segment, instead of just
@@ -914,38 +912,38 @@
 
             // CHECK FOR ENTRY SEGMENT CROSSING INTO JB
             // If entry is outside JB and exit crosses out of JB boundary, move marker to boundary
-            var markerAnchor = node;
-            var isSquareMarker = false;
-            var entryIsInJB = sdk.DataModel.Segments.isContainedInBigJunction({ segmentId: a_in[1] });
+            let markerAnchor = node;
+            let isSquareMarker = false;
+            let entryIsInJB = await sdk.DataModel.Segments.isContainedInBigJunction({ segmentId: a_in[1] });
 
             // Only check for boundary crossing if entry is outside JB
             if (!entryIsInJB) {
-              var exitSegment = sdk.DataModel.Segments.getById({ segmentId: angle[1] });
+              let exitSegment = await sdk.DataModel.Segments.getById({ segmentId: angle[1] });
               if (exitSegment) {
                 // Search for JB that the exit segment crosses OUT of
-                for (var bji = 0; bji < allBigJunctions.length; bji++) {
-                  var bjPolygon = turf.polygon(allBigJunctions[bji].geometry.coordinates);
+                for (let bji = 0; bji < allBigJunctions.length; bji++) {
+                  let bjPolygon = turf.polygon(allBigJunctions[bji].geometry.coordinates);
 
                   // Check if current node is inside this JB
-                  var nodeIsInside = turf.booleanPointInPolygon(turf.point(node.geometry.coordinates), bjPolygon);
+                  let nodeIsInside = turf.booleanPointInPolygon(turf.point(node.geometry.coordinates), bjPolygon);
 
                   if (nodeIsInside) {
                     // Get the far endpoint of exit segment (node that's NOT the current node)
-                    var exitCoords = exitSegment.geometry.coordinates;
-                    var farEndpoint =
+                    let exitCoords = exitSegment.geometry.coordinates;
+                    let farEndpoint =
                       Math.abs(exitCoords[0][0] - node.geometry.coordinates[0]) < 0.0001 && Math.abs(exitCoords[0][1] - node.geometry.coordinates[1]) < 0.0001 ? exitCoords[1] : exitCoords[0];
 
-                    var farIsInside = turf.booleanPointInPolygon(turf.point(farEndpoint), bjPolygon);
+                    let farIsInside = turf.booleanPointInPolygon(turf.point(farEndpoint), bjPolygon);
 
                     // If node is inside and far endpoint is outside, this exit crosses out of JB
                     if (!farIsInside) {
-                      var closestPt = ja_find_closest_bj_intersection(exitSegment, bjPolygon, node);
+                      let closestPt = ja_find_closest_bj_intersection(exitSegment, bjPolygon, node);
                       if (closestPt !== null) {
                         markerAnchor = { geometry: closestPt.geometry };
                         isSquareMarker = true;
                         // Recalculate point from boundary anchor
                         // Use larger distance (3.5x) to avoid overlapping with WME's turn restriction arrows at the boundary
-                        var boundaryLd = ja_corrected_ld(ja_label_distance, markerAnchor.geometry.coordinates);
+                        let boundaryLd = ja_corrected_ld(ja_label_distance, markerAnchor.geometry.coordinates);
                         point = turf.destination(turf.point(markerAnchor.geometry.coordinates), (boundaryLd * 3.5) / 1000, ja_math_to_compass(ha)).geometry;
                         ja_log('[JAI] Marker moved to JB boundary (3.5x distance)', 3);
                         break;
@@ -955,7 +953,7 @@
                 }
               }
             }
-            ja_draw_marker(
+            await ja_draw_marker(
               point,
               markerAnchor,
               ja_ld,
@@ -977,8 +975,8 @@
             //draw double turn markers
             // If there are double-turn markers at this node+bearing, offset them farther out
             // Use larger offset if at JB boundary to avoid WME turn restriction arrows
-            var doubleTurnDepartureMult = isSquareMarker ? 4.2 : 2.7;
-            doubleTurns.forEachItem(a_in[1], angle[1], function (item) {
+            let doubleTurnDepartureMult = isSquareMarker ? 4.2 : 2.7;
+            doubleTurns.forEachItem(a_in[1], angle[1], async function (item) {
               if ((isSquareMarker && doubleTurnDepartureMult === 4.2) || (!isSquareMarker && doubleTurnDepartureMult === 2.7)) {
                 // First double-turn found at this anchor (boundary or node)
                 doubleTurnDepartureMult = isSquareMarker ? 4.9 : 3.3;
@@ -986,12 +984,12 @@
                 ja_log('[DOUBLE-TURN] Offset double-turn markers at node ' + node.id + ' by ' + doubleTurnDepartureMult.toFixed(1) + 'x (departure mode)' + boundarySuffix, 2);
               }
               var doubleTurnDeparturePoint = turf.destination(turf.point(markerAnchor.geometry.coordinates), (doubleTurnDepartureMult * ja_ld) / 1000, ja_math_to_compass(ha)).geometry;
-              ja_draw_marker(doubleTurnDeparturePoint, markerAnchor, ja_ld, item.angle, ha, true, item.turn_type, false, isSquareMarker);
+              await ja_draw_marker(doubleTurnDeparturePoint, markerAnchor, ja_ld, item.angle, ha, true, item.turn_type, false, isSquareMarker);
             });
           } else {
             ja_log('Angle between ' + angle[1] + ' and ' + angles[(j + 1) % angles.length][1] + ' is ' + a + ' and position for label should be at ' + ha, 3);
             point = turf.destination(turf.point(node.geometry.coordinates), (ja_ld * 1.25) / 1000, ja_math_to_compass(ha)).geometry;
-            ja_draw_marker(point, node, ja_ld, a, ha);
+            await ja_draw_marker(point, node, ja_ld, a, ha);
 
             // Record this local marker for far-turn conflict detection
             // (Far-turn markers drawn later will check this data and adjust their distance if needed)
@@ -1000,7 +998,7 @@
             }
             ja_local_markers_by_node[node.id].push({ bearing: ha, distance: 1.25 * ja_ld });
           }
-        });
+        };
       }
 
       // ── Far turn markers (experimental) ─────────────────────────────────
@@ -1028,7 +1026,7 @@
       // by the regular node-pair loop above; far-turn exit markers would be misleading.
       // Also suppressed when a pure node is selected: show only absolute angles at that node.
       if (ja_getOption('angleMode') === 'aDeparture' && !ja_selected_has_median && !ja_is_pure_node_selection) {
-        ja_draw_far_turn_markers(node, ja_label_distance, ja_selected_seg_ids, allBigJunctions);
+        await ja_draw_far_turn_markers(node, ja_label_distance, ja_selected_seg_ids, allBigJunctions);
       }
 
       // ── CACHE WRITE-BACK: Push fresh angles to continuous cache ────────────
@@ -1044,7 +1042,7 @@
       // but continuous rendering needs ALL pairs. So we call ja_calculate_angles_for_node()
       // to generate the full set with complete routing type information.
       if (ja_continuous_mode && ja_is_valid_routing_node(node)) {
-        var fullAngles = ja_calculate_angles_for_node(node);
+        var fullAngles = await ja_calculate_angles_for_node(node);
         ja_write_to_cache(node.id, fullAngles);
       }
     }
@@ -1052,25 +1050,25 @@
     // Draw far-exit double-turn markers triggered by arm selection.
     // Placed at the median's far node along the exit arm's bearing — matching the
     // visual position produced when the median itself is selected directly.
-    doubleTurns.farExitMarkers.forEach(function (item) {
-      var farNode = sdk.DataModel.Nodes.getById({ nodeId: item.farNodeId });
-      if (!farNode) return;
-      var farLd = ja_corrected_ld(ja_label_distance, farNode.geometry.coordinates);
+    for (const item of (doubleTurns.farExitMarkers)) {
+      let farNode = await sdk.DataModel.Nodes.getById({ nodeId: item.farNodeId });
+      if (!farNode) continue;
+      let farLd = ja_corrected_ld(ja_label_distance, farNode.geometry.coordinates);
 
       // CHECK FOR LOCAL TURN MARKER CONFLICT AT FAR NODE
       // If a local turn at this far node targets the same direction, move this far-exit marker out farther
-      var hasFarNodeConflict = ja_local_markers_by_node[item.farNodeId] &&
+      let hasFarNodeConflict = ja_local_markers_by_node[item.farNodeId] &&
                                ja_local_markers_by_node[item.farNodeId].some(function(ltMarker) {
                                  return ja_markers_target_same_direction(item.exitBearing, ltMarker.bearing, 30);
                                });
-      var farExitDist = hasFarNodeConflict ? 3.2 : 2.0;
+      let farExitDist = hasFarNodeConflict ? 3.2 : 2.0;
       if (hasFarNodeConflict) {
         ja_log('[MARKER-OVERLAP] Far-exit conflict at node ' + item.farNodeId + ': 3.2x distance', 3);
       }
 
-      var pt = turf.destination(turf.point(farNode.geometry.coordinates), (farExitDist * farLd) / 1000, ja_math_to_compass(item.exitBearing)).geometry;
-      ja_draw_marker(pt, farNode, farLd, item.angle, item.exitBearing, true, item.turn_type);
-    });
+      let pt = turf.destination(turf.point(farNode.geometry.coordinates), (farExitDist * farLd) / 1000, ja_math_to_compass(item.exitBearing)).geometry;
+      await ja_draw_marker(pt, farNode, farLd, item.angle, item.exitBearing, true, item.turn_type);
+    };
 
     return false;
   }
@@ -1125,7 +1123,7 @@
    * Calculates angles, caches them, and renders immediately (adds to existing layer, no clearing).
    * Schedules next batch via setTimeout (50ms delay = non-blocking).
    */
-  function ja_scan_nodes_batch_from_list(batchSize) {
+  async function ja_scan_nodes_batch_from_list(batchSize) {
     if (!ja_continuous_mode) return;
     if (ja_continuous_needs_batching.length === 0) return;
 
@@ -1141,7 +1139,8 @@
 
       // Recalculate angles for this cache miss
       ja_log('Calculating angles for new node ' + node.id, 3);
-      var angles = ja_calculate_angles_for_node(node);
+      var angles = await ja_calculate_angles_for_node_safe(node);
+      if (angles === null) continue;  // Failed: leave uncached so the next scan retries it
 
       // Store in cache
       ja_write_to_cache(node.id, angles);
@@ -1153,9 +1152,9 @@
         var markerKey = node.id + '_' + angle.s_in_id + '_' + angle.s_out_id + '_' + Math.round(angle.angle * 10);
 
         if (!ja_continuous_rendered.has(markerKey)) {
-          var labelDistance = ja_compute_label_distance();
+          var labelDistance = await ja_compute_label_distance();
           var pt = turf.destination(turf.point(node.geometry.coordinates), (labelDistance) / 1000, ja_math_to_compass(angle.bearing)).geometry;
-          ja_draw_marker(pt, node, labelDistance, angle.angle, angle.bearing, true, angle.type, false, false);
+          await ja_draw_marker(pt, node, labelDistance, angle.angle, angle.bearing, true, angle.type, false, false);
           ja_continuous_rendered.add(markerKey);
         }
       }
@@ -1166,7 +1165,7 @@
 
     // If more misses to process, schedule next batch
     if (ja_continuous_batch_index < ja_continuous_needs_batching.length) {
-      setTimeout(() => ja_scan_nodes_batch_from_list(batchSize), BATCH_PROCESSING_DELAY);
+      setTimeout(async () => await ja_scan_nodes_batch_from_list(batchSize), BATCH_PROCESSING_DELAY);
       ja_log('Batch processing took ' + (batchEndTime - batchStartTime) + 'ms. Next batch in ' + BATCH_PROCESSING_DELAY + 'ms...', 2);
     } else {
       var totalCacheSize = Object.keys(ja_continuous_cache).length;
@@ -1189,7 +1188,7 @@
    * Markers persist on layer until segment edits invalidate cache for that node.
    * Schedules next batch via setTimeout (BATCH_PROCESSING_DELAY ms = non-blocking).
    */
-  function ja_scan_nodes_batch(batchSize) {
+  async function ja_scan_nodes_batch(batchSize) {
     if (!ja_continuous_mode) return;  // Bail if continuous mode disabled
 
     var batchStartTime = Date.now();
@@ -1216,7 +1215,8 @@
       // Cache miss or expired: recalculate angles using existing JAI logic
       batchCacheMisses++;
       ja_log('Cache MISS: node ' + node.id, 4);
-      var angles = ja_calculate_angles_for_node(node);
+      var angles = await ja_calculate_angles_for_node_safe(node);
+      if (angles === null) continue;  // Failed: leave uncached so the next scan retries it
 
       // Store in cache
       ja_write_to_cache(node.id, angles);
@@ -1227,7 +1227,7 @@
 
     // If more nodes to process, schedule next batch with BATCH_PROCESSING_DELAY (keeps editor responsive)
     if (ja_continuous_batch_index < ja_nodes_all.length) {
-      setTimeout(() => ja_scan_nodes_batch(batchSize), BATCH_PROCESSING_DELAY);
+      setTimeout(async () => await ja_scan_nodes_batch(batchSize), BATCH_PROCESSING_DELAY);
       ja_log('Batch took ' + (batchEndTime - batchStartTime) + 'ms (' + batchCacheHits + ' hits / ' + batchCacheMisses + ' misses). Next batch in ' + BATCH_PROCESSING_DELAY + 'ms...', 2);
     } else {
       var totalCacheSize = Object.keys(ja_continuous_cache).length;
@@ -1238,8 +1238,23 @@
         }
       }
       ja_log('Complete scan done: ' + totalCacheSize + ' nodes / ' + totalAnglePairs + ' angle pairs. Final batch: ' + (batchEndTime - batchStartTime) + 'ms (' + batchCacheHits + ' hits / ' + batchCacheMisses + ' misses). Rendering PROBLEM markers...', 2);
-      ja_render_continuous_problems();
+      await ja_render_continuous_problems();
       ja_continuous_batch_index = 0;  // Reset for next scan
+    }
+  }
+
+  /**
+   * Batch-safe wrapper around ja_calculate_angles_for_node. A node can disappear from the model
+   * while a batch is running (fast map moves), which makes an SDK lookup throw. Log it and return
+   * null so the batch continues. Callers must not cache a null result, otherwise the failed node
+   * is treated as "no problems" for the whole cache TTL instead of being retried.
+   */
+  async function ja_calculate_angles_for_node_safe(node) {
+    try {
+      return await ja_calculate_angles_for_node(node);
+    } catch (e) {
+      ja_log('Skipping node ' + node.id + ' (angle calculation failed): ' + (e && e.message ? e.message : e), 2);
+      return null;
     }
   }
 
@@ -1248,7 +1263,7 @@
    * Returns array of angle objects with type (PROBLEM, TURN, KEEP, BC, U_TURN, etc.)
    * Reuses ja_guess_routing_instruction() which detects gray zones correctly.
    */
-  function ja_calculate_angles_for_node(node) {
+  async function ja_calculate_angles_for_node(node) {
     var nodeSegmentIds = node.connectedSegmentIds;
     if (nodeSegmentIds.length < 3) return [];  // Skip 2-way roads
 
@@ -1256,7 +1271,7 @@
     // This is what ja_guess_routing_instruction expects
     var angles_raw = [];
     for (var i = 0; i < nodeSegmentIds.length; i++) {
-      var seg_i = sdk.DataModel.Segments.getById({ segmentId: nodeSegmentIds[i] });
+      var seg_i = await sdk.DataModel.Segments.getById({ segmentId: nodeSegmentIds[i] });
       if (!seg_i) continue;
 
       var bearing_i = ja_getAngle(node.id, seg_i);
@@ -1278,7 +1293,7 @@
         var angle = ja_angle_diff(angles_raw[i][0], angles_raw[j][0], false);
 
         // Get routing type using existing function (includes gray zone detection)
-        var routingType = ja_guess_routing_instruction(node, s_in_id, s_out_id, angles_raw);
+        var routingType = await ja_guess_routing_instruction(node, s_in_id, s_out_id, angles_raw);
         ja_log('Angle pair: ' + s_in_id + ' → ' + s_out_id + ' = ' + routingType, 4);
 
         // Compute midpoint bearing for marker placement (handles wrap-around at 0°/360°)
@@ -1314,11 +1329,11 @@
    * Filters to PROBLEM type only (like BJAI's optimization).
    * Reuses ja_draw_marker() for consistent styling.
    */
-  function ja_render_continuous_problems() {
+  async function ja_render_continuous_problems() {
     if (!ja_continuous_mode) return;
 
     // Don't render continuous markers if user has a selection active (on-demand markers take priority)
-    if (hasSelection()) {
+    if (await hasSelection()) {
       ja_log('Skipping continuous marker render (selection active)', 3);
       return;
     }
@@ -1331,7 +1346,7 @@
       if (!ja_continuous_cache.hasOwnProperty(nodeId)) continue;
 
       var entry = ja_continuous_cache[nodeId];
-      var node = sdk.DataModel.Nodes.getById({ nodeId: parseInt(nodeId) });
+      var node = await sdk.DataModel.Nodes.getById({ nodeId: parseInt(nodeId) });
       if (!node) continue;
 
       nodeCount++;
@@ -1352,13 +1367,13 @@
           continue;
         }
 
-        var labelDistance = ja_compute_label_distance();
+        var labelDistance = await ja_compute_label_distance();
 
         // Calculate marker position (midpoint bearing, offset from node)
         var pt = turf.destination(turf.point(node.geometry.coordinates), (labelDistance) / 1000, ja_math_to_compass(angle.bearing)).geometry;
 
         // Draw using existing JAI marker function (reuses styling)
-        ja_draw_marker(pt, node, labelDistance, angle.angle, angle.bearing, true, angle.type, false, false);
+        await ja_draw_marker(pt, node, labelDistance, angle.angle, angle.bearing, true, angle.type, false, false);
 
         // Mark this angle as rendered
         ja_continuous_rendered.add(markerKey);
@@ -1384,17 +1399,17 @@
    *
    * Called by pan/zoom/edit event handlers.
    */
-  function ja_start_continuous_scan() {
+  async function ja_start_continuous_scan() {
     if (!ja_continuous_mode) return;
 
     // Skip if zoomed out below minimum level
-    if (sdk.Map.getZoomLevel() < MIN_ZOOM_LEVEL) {
-      ja_log('Zoom level ' + sdk.Map.getZoomLevel() + ' < ' + MIN_ZOOM_LEVEL + ', skipping continuous scan', 3);
+    if (await sdk.Map.getZoomLevel() < MIN_ZOOM_LEVEL) {
+      ja_log('Zoom level ' + await sdk.Map.getZoomLevel() + ' < ' + MIN_ZOOM_LEVEL + ', skipping continuous scan', 3);
       return;
     }
 
     // Skip if user has selection active (on-demand is showing, don't interfere)
-    if (hasSelection()) {
+    if (await hasSelection()) {
       ja_log('Selection active, skipping continuous scan', 3);
       return;
     }
@@ -1403,7 +1418,7 @@
     // ja_current_features holds marker positions used by ja_draw_marker() for collision detection.
     // If we don't clear it, collision detection will reference old positions from previous zoom level,
     // causing markers to be nudged further away with each zoom cycle (accumulation drift).
-    sdk.Map.removeAllFeaturesFromLayer({ layerName: 'junction_angles' });
+    await sdk.Map.removeAllFeaturesFromLayer({ layerName: 'junction_angles' });
     ja_continuous_rendered.clear();
     ja_current_features = [];
     ja_feature_counter = 0;
@@ -1411,7 +1426,7 @@
 
     // Snapshot current viewport nodes using modern SDK API
     var scanStartTime = Date.now();
-    ja_nodes_all = sdk.DataModel.Nodes.getAll() || [];
+    ja_nodes_all = await sdk.DataModel.Nodes.getAll() || [];
     ja_continuous_batch_index = 0;
     ja_continuous_needs_batching = [];
 
@@ -1451,9 +1466,9 @@
           var angle = problemAngles[j];
           var markerKey = node.id + '_' + angle.s_in_id + '_' + angle.s_out_id + '_' + Math.round(angle.angle * 10);
 
-          var labelDistance = ja_compute_label_distance();  // Current zoom's distance
+          var labelDistance = await ja_compute_label_distance();  // Current zoom's distance
           var pt = turf.destination(turf.point(node.geometry.coordinates), (labelDistance) / 1000, ja_math_to_compass(angle.bearing)).geometry;
-          ja_draw_marker(pt, node, labelDistance, angle.angle, angle.bearing, true, angle.type, false, false);
+          await ja_draw_marker(pt, node, labelDistance, angle.angle, angle.bearing, true, angle.type, false, false);
           ja_continuous_rendered.add(markerKey);
         }
       } else {
@@ -1468,7 +1483,7 @@
 
     // PHASE 2: Batch process cache misses (20-node batches: 6ms calc + 50ms delay = fast & responsive)
     if (ja_continuous_needs_batching.length > 0) {
-      ja_scan_nodes_batch_from_list(20);
+      await ja_scan_nodes_batch_from_list(20);
     } else {
       var finalCacheSize = Object.keys(ja_continuous_cache).length;
       ja_log('SCAN COMPLETE: No cache misses, all nodes fresh. Final cache: ' + finalCacheSize + ' nodes. Total time: ' + (phase1EndTime - scanStartTime) + 'ms', 2);
@@ -1480,12 +1495,12 @@
    * Cancels pending timeout if new event fires within 100ms, then reschedules.
    * Called by zoom/pan/edit event handlers.
    */
-  function ja_debounced_continuous_scan() {
+  async function ja_debounced_continuous_scan() {
     if (!ja_continuous_mode) return;
 
     // Skip if zoomed out below minimum level
-    if (sdk.Map.getZoomLevel() < MIN_ZOOM_LEVEL) {
-      ja_log('Zoom level ' + sdk.Map.getZoomLevel() + ' < ' + MIN_ZOOM_LEVEL + ', skipping debounced scan', 3);
+    if (await sdk.Map.getZoomLevel() < MIN_ZOOM_LEVEL) {
+      ja_log('Zoom level ' + await sdk.Map.getZoomLevel() + ' < ' + MIN_ZOOM_LEVEL + ', skipping debounced scan', 3);
       return;
     }
 
@@ -1496,8 +1511,8 @@
     }
 
     // Schedule new scan CONTINUOUS_SCAN_DEBOUNCE from now (allows batching of rapid events)
-    ja_continuous_scan_timer = setTimeout(() => {
-      ja_start_continuous_scan();
+    ja_continuous_scan_timer = setTimeout(async () => {
+      await ja_start_continuous_scan();
       ja_continuous_scan_timer = null;
     }, CONTINUOUS_SCAN_DEBOUNCE);
   }
@@ -1518,9 +1533,9 @@
    *
    * Exits early if the data model returns stale data that requires a deferred retry.
    */
-  function testSelectedItem() {
+  async function testSelectedItem() {
     // Always clear the layer first to stay in sync with selection state
-    sdk.Map.removeAllFeaturesFromLayer({ layerName: 'junction_angles' });
+    await sdk.Map.removeAllFeaturesFromLayer({ layerName: 'junction_angles' });
     ja_roundabout_points = [];
     ja_current_features = [];
     ja_feature_counter = 0;
@@ -1540,24 +1555,24 @@
     ja_far_turn_bearings_by_node = {};
 
     // Cache traffic handedness for this render pass (used in ja_guess_routing_instruction and ja_draw_roundabout_entry_exits)
-    ja_is_left_hand_traffic = (sdk.DataModel.Countries.getAll()[0] || {}).isLeftHandTraffic || false;
+    ja_is_left_hand_traffic = ((await sdk.DataModel.Countries.getAll())[0] || {}).isLeftHandTraffic || false;
 
     // Early exit if nothing is selected (after cleanup)
-    var ja_selfeat = getselfeat();
+    var ja_selfeat = await getselfeat();
     if (ja_selfeat.length === 0 || ja_selfeat.length > 2) {
       // Nothing selected — re-render continuous markers if enabled and zoom is sufficient
-      if (ja_continuous_mode && sdk.Map.getZoomLevel() >= MIN_ZOOM_LEVEL) {
+      if (ja_continuous_mode && await sdk.Map.getZoomLevel() >= MIN_ZOOM_LEVEL) {
         ja_log('No selection active. Re-rendering continuous markers (deselect/no-op call)...', 2);
-        ja_render_continuous_problems();
+        await ja_render_continuous_problems();
       }
       return;
     }
 
-    if (sdk.Map.getZoomLevel() < MIN_ZOOM_LEVEL) {
+    if (await sdk.Map.getZoomLevel() < MIN_ZOOM_LEVEL) {
       return;
     }
     if (ja_getOption('roundaboutOverlayDisplay') === 'rOverAlways') {
-      ja_draw_roundabout_overlay();
+      await ja_draw_roundabout_overlay();
     }
 
     var ja_start_time = Date.now();
@@ -1568,8 +1583,8 @@
       if (ja_selfeat[0].type !== 'segment' || ja_selfeat[1].type !== 'segment') {
         return;
       }
-      var seg0 = sdk.DataModel.Segments.getById({ segmentId: ja_selfeat[0].id });
-      var seg1 = sdk.DataModel.Segments.getById({ segmentId: ja_selfeat[1].id });
+      var seg0 = await sdk.DataModel.Segments.getById({ segmentId: ja_selfeat[0].id });
+      var seg1 = await sdk.DataModel.Segments.getById({ segmentId: ja_selfeat[1].id });
       if (!seg0 || !seg1) {
         return;
       }
@@ -1585,11 +1600,11 @@
       ja_nodes.push(sharedNodeId);
     } else {
       // Single feature — extract endpoint nodes from segment, or push node id directly
-      ja_selfeat.forEach(function (element) {
+      for (const element of ja_selfeat) {
         if (element.type === 'node') {
           ja_nodes.push(element.id);
         } else if (element.type === 'segment') {
-          var seg = sdk.DataModel.Segments.getById({ segmentId: element.id });
+          let seg = await sdk.DataModel.Segments.getById({ segmentId: element.id });
           if (seg && seg.fromNodeId != null && ja_nodes.indexOf(seg.fromNodeId) === -1) {
             ja_nodes.push(seg.fromNodeId);
           }
@@ -1598,12 +1613,12 @@
           }
         }
         ja_log(ja_nodes, 4);
-      });
+      };
     }
 
-    var ja_label_distance = ja_compute_label_distance();
+    var ja_label_distance = await ja_compute_label_distance();
     // Cache BigJunctions for the entire render pass — eliminates 5 separate .getAll() calls
-    var allBigJunctions = sdk.DataModel.BigJunctions.getAll();
+    var allBigJunctions = await sdk.DataModel.BigJunctions.getAll();
 
     // When a node is directly selected (not via segment selection), suppress roundabout/path/junction
     // markers — show only the node's absolute angle markers (angles at that specific node).
@@ -1611,8 +1626,8 @@
 
     // Only draw roundabout and path/junction markers if NOT a pure node selection
     if (!ja_is_pure_node_selection) {
-      var ja_selected_roundabouts = ja_find_roundabouts(ja_nodes);
-      ja_draw_roundabout_markers(ja_selected_roundabouts, ja_label_distance);
+      var ja_selected_roundabouts = await ja_find_roundabouts(ja_nodes);
+      await ja_draw_roundabout_markers(ja_selected_roundabouts, ja_label_distance);
     }
 
     // When a single roundabout arc is selected, ja_draw_roundabout_entry_exits already shows
@@ -1620,20 +1635,24 @@
     // regular intersection-style angles don't fire on the roundabout's own nodes.
     var ja_marker_nodes = ja_nodes;
     if (ja_selfeat.length === 1 && ja_selfeat[0].type === 'segment') {
-      var _arcSeg = sdk.DataModel.Segments.getById({ segmentId: ja_selfeat[0].id });
+      var _arcSeg = await sdk.DataModel.Segments.getById({ segmentId: ja_selfeat[0].id });
       if (_arcSeg && _arcSeg.junctionId !== null) {
         ja_marker_nodes = [];
       }
     }
 
-    var doubleTurns = ja_collect_double_turns(ja_marker_nodes, allBigJunctions);
+    var doubleTurns = await ja_collect_double_turns(ja_marker_nodes, allBigJunctions);
 
     // True if any selected segment is contained inside a BigJunction (a median/intermediate
     // segment). In that case ja_draw_node_markers suppresses far-turn markers: the regular
     // node-pair loop handles internal angles, and far-turn exit markers would be misleading.
-    var ja_selected_has_median = ja_selfeat.some(function (feat) {
-      return feat.type === 'segment' && sdk.DataModel.Segments.isContainedInBigJunction({ segmentId: feat.id });
-    });
+    var ja_selected_has_median = false;
+    for (const feat of ja_selfeat) {
+      if (feat.type === 'segment' && (await sdk.DataModel.Segments.isContainedInBigJunction({ segmentId: feat.id }))) {
+        ja_selected_has_median = true;
+        break;
+      }
+    }
 
     // IDs of the segments explicitly selected by the user. Used to restrict far-turn marker
     // drawing to only the selected entry segment(s), matching how regular departure-mode
@@ -1649,7 +1668,7 @@
         return feat.id;
       });
 
-    if (ja_draw_node_markers(ja_marker_nodes, ja_label_distance, doubleTurns, ja_selected_has_median, ja_selected_seg_ids, allBigJunctions, ja_is_pure_node_selection)) {
+    if (await ja_draw_node_markers(ja_marker_nodes, ja_label_distance, doubleTurns, ja_selected_has_median, ja_selected_seg_ids, allBigJunctions, ja_is_pure_node_selection)) {
       return;
     }
 
@@ -1664,9 +1683,9 @@
     // After on-demand rendering completes, only re-render continuous markers if NO selection active
     // When user has something selected, on-demand markers take priority (continuous would clutter the view)
     // When user deselects, continuous markers reappear to show background problems
-    if (ja_continuous_mode && !hasSelection()) {
+    if (ja_continuous_mode && !await hasSelection()) {
       ja_log('No selection active. Re-rendering continuous markers...', 2);
-      ja_render_continuous_problems();
+      await ja_render_continuous_problems();
     }
   }
 
@@ -1686,9 +1705,9 @@
    * Get the SVG polyline element for the selected segment
    * Used by drag-time polling to extract live geometry during edits
    */
-  function ja_getDragGeometryPoller(segmentId) {
+  async function ja_getDragGeometryPoller(segmentId) {
     try {
-      var element = sdk.Map.getFeatureDomElement({
+      var element = await sdk.Map.getFeatureDomElement({
         featureId: segmentId,
         layerName: 'segments'
       });
@@ -1731,9 +1750,9 @@
    * Convert SVG map-pixel coordinates to lat/lon using SDK conversion
    * Map-pixel coords are relative to the top-left of the map component (not screen)
    */
-  function ja_pixelToLatLon(pixelX, pixelY) {
+  async function ja_pixelToLatLon(pixelX, pixelY) {
     try {
-      var lonLat = sdk.Map.getLonLatFromMapPixel({ x: pixelX, y: pixelY });
+      var lonLat = await sdk.Map.getLonLatFromMapPixel({ x: pixelX, y: pixelY });
       return { lat: lonLat.lat, lon: lonLat.lon };
     } catch (e) {
       ja_log('Error converting pixel to lat/lon: ' + e.message, 1);
@@ -1745,16 +1764,16 @@
    * Convert all SVG geopoints to lat/lon coordinates
    * Extracts from polyline and transforms to geographic coordinates
    */
-  function ja_getSVGCoordsAsLatLon(polylineElement) {
+  async function ja_getSVGCoordsAsLatLon(polylineElement) {
     var pixelCoords = ja_extractGeopointsFromSVG(polylineElement);
     var latLonCoords = [];
 
-    pixelCoords.forEach(function(coord) {
-      var latLon = ja_pixelToLatLon(coord.pixelX, coord.pixelY);
+    for (const coord of pixelCoords) {
+      let latLon = await ja_pixelToLatLon(coord.pixelX, coord.pixelY);
       if (latLon) {
         latLonCoords.push(latLon);
       }
-    });
+    };
 
     return latLonCoords;
   }
@@ -1787,7 +1806,7 @@
    * When coordinates change: calls testSelectedItem() directly to redraw markers in real-time
    * Bypasses ja_calculate() debounce for immediate visual feedback
    */
-  function ja_pollSegmentGeometryDuringDrag() {
+  async function ja_pollSegmentGeometryDuringDrag() {
     if (!ja_drag_geometry_polling_enabled || !ja_drag_geometry_selected_segment_id) return;
 
     var now = Date.now();
@@ -1795,14 +1814,14 @@
     ja_drag_geometry_last_poll_time = now;
 
     // Get the SVG polyline element
-    var polyline = ja_getDragGeometryPoller(ja_drag_geometry_selected_segment_id);
+    var polyline = await ja_getDragGeometryPoller(ja_drag_geometry_selected_segment_id);
     if (!polyline) {
       ja_log('SVG polyline not found for segment ' + ja_drag_geometry_selected_segment_id, 2);
       return;
     }
 
     // Extract current coordinates
-    var currentCoords = ja_getSVGCoordsAsLatLon(polyline);
+    var currentCoords = await ja_getSVGCoordsAsLatLon(polyline);
     if (currentCoords.length === 0) {
       ja_log('No coordinates extracted from SVG', 2);
       return;
@@ -1817,7 +1836,7 @@
 
       // Direct call to testSelectedItem bypasses 200ms debounce for real-time feedback
       // Safe: testSelectedItem() is idempotent (clears layer first)
-      testSelectedItem();
+      await testSelectedItem();
 
       // Clear live coords after render (reset for next poll)
       ja_drag_geometry_live_coords = null;
@@ -1875,7 +1894,7 @@
    * @param {boolean} [logRestrictions=true] - If false, suppresses logging of turn blocks (used to reduce redundant logs during batch processing and far-turn evaluations).
    * @returns {string} A ja_routing_type value string (e.g., 'junction_turn', 'junction_keep_left', 'junction_problem').
    */
-  function ja_guess_routing_instruction(node, s_in_a, s_out_a, angles, logRestrictions) {
+  async function ja_guess_routing_instruction(node, s_in_a, s_out_a, angles, logRestrictions) {
     if (typeof logRestrictions === 'undefined') logRestrictions = true;  // Default: log turn blocks
     var s_n = {},
       s_in = null,
@@ -1893,10 +1912,10 @@
       return element[1] === s_out_a;
     });
 
-    node.connectedSegmentIds.forEach(function (element) {
+    for (const element of (node.connectedSegmentIds)) {
       if (element === s_in_id) {
-        s_in = sdk.DataModel.Segments.getById({ segmentId: element });
-        street_in = ja_get_streets(element);
+        s_in = await sdk.DataModel.Segments.getById({ segmentId: element });
+        street_in = await ja_get_streets(element);
         if (street_in.primary == null) {
           street_in.primary = { name: '' };
         } else if (street_in.primary.name == null) {
@@ -1904,18 +1923,22 @@
         }
       } else {
         if (element === s_out_id) {
-          s_out[element] = sdk.DataModel.Segments.getById({ segmentId: element });
+          s_out[element] = await sdk.DataModel.Segments.getById({ segmentId: element });
+          if (s_out[element] == null) {
+            ja_log('ja_guess_routing_instruction: exit segment ' + element + ' not found in model', 2);
+            return ja_routing_type.PROBLEM;
+          }
           if (typeof s_out[element].primary === 'undefined') {
             s_out[element].primary = { name: '' };
           }
         }
-        s_n[element] = sdk.DataModel.Segments.getById({ segmentId: element });
-        street_n[element] = ja_get_streets(element);
+        s_n[element] = await sdk.DataModel.Segments.getById({ segmentId: element });
+        street_n[element] = await ja_get_streets(element);
         if (street_n[element].primary == null) {
           street_n[element].primary = { name: '' };
         }
       }
-    });
+    };
 
     if (s_in === null || street_in === null) {
       return ja_routing_type.PROBLEM;
@@ -1924,7 +1947,7 @@
     angle = ja_angle_diff(s_in_a[0], s_out_a[0], false);
     ja_log('Angle: ' + angle.toFixed(1) + '°', 4);
 
-    if (!ja_is_turn_allowed(s_in, node, s_out[s_out_id])) {
+    if (!await ja_is_turn_allowed(s_in, node, s_out[s_out_id])) {
       if (logRestrictions) {
         ja_log('Turn blocked: ' + s_in_id + ' → ' + s_out_id + ' via ' + node.id, 2);
       }
@@ -1933,7 +1956,7 @@
 
     //seb-d59: Check override instruction
     if (ja_getOption('override')) {
-      var turns = sdk.DataModel.Turns.getTurnsThroughNode({ nodeId: node.id });
+      var turns = await sdk.DataModel.Turns.getTurnsThroughNode({ nodeId: node.id });
       var overrideTurn = turns.find(function (t) {
         return t.fromSegmentId === s_in_id && t.toSegmentId === s_out_id;
       });
@@ -1976,17 +1999,19 @@
     if (Math.abs(angle) < TURN_ANGLE - GRAY_ZONE) {
       ja_log('Angle < 44° (BC eval zone)', 4);
 
-      angles = angles.filter(function (a) {
-        if (s_out_id === a[1] || (typeof s_n[a[1]] !== 'undefined' && ja_is_turn_allowed(s_in, node, s_n[a[1]]) && Math.abs(ja_angle_diff(s_in_a, a[0], false)) < TURN_ANGLE)) {
-          return true;
+      // Sequential (not Promise.all) because the predicate mutates s_n/street_n as it goes
+      const kept = [];
+      for (const a of angles) {
+        if (s_out_id === a[1] || (typeof s_n[a[1]] !== 'undefined' && (await ja_is_turn_allowed(s_in, node, s_n[a[1]])) && Math.abs(ja_angle_diff(s_in_a, a[0], false)) < TURN_ANGLE)) {
+          kept.push(a);
         } else {
           if (street_n[a[1]]) {
             delete s_n[a[1]];
             delete street_n[a[1]];
           }
-          return false;
         }
-      });
+      }
+      angles = kept;
 
       if (angles.length <= 1) {
         return ja_routing_type.BC;
@@ -2103,7 +2128,7 @@
    * @param {boolean} [isFarTurn=false] - True for far-turn markers (path/JB breadcrumbs).
    * @param {boolean} [isSquareMarker=false] - True to render as square; false for round (intermediate breadcrumb).
    */
-  function ja_draw_marker(point, node, ja_label_distance, a, ha, withRouting, ja_junction_type, isFarTurn, isSquareMarker) {
+  async function ja_draw_marker(point, node, ja_label_distance, a, ha, withRouting, ja_junction_type, isFarTurn, isSquareMarker) {
     //Try to estimate of the point is "too close" to another point
     //(or maybe something else in the future; like turn restriction arrows or something)
     //FZ69617: Exctract initial label distance from point
@@ -2244,11 +2269,11 @@
     }
 
     //Draw a line to the point
-    ja_add_feature({ type: 'LineString', coordinates: [node.geometry.coordinates, point.coordinates] }, { ja_type: 'arrow_line' });
+    await ja_add_feature({ type: 'LineString', coordinates: [node.geometry.coordinates, point.coordinates] }, { ja_type: 'arrow_line' });
 
     //push the angle point
     ja_current_features.push({ coordinates: point.coordinates, ja_type: angleProps.ja_type });
-    ja_add_feature(point, angleProps);
+    await ja_add_feature(point, angleProps);
   }
 
   /**
@@ -2264,27 +2289,26 @@
    *
    * @param {number} [junctionId] - Optional. If provided, draws only this junction's circle.
    */
-  function ja_draw_roundabout_overlay(junctionId) {
-    (junctionId === undefined
-      ? sdk.DataModel.Junctions.getAll()
+  async function ja_draw_roundabout_overlay(junctionId) {
+    for (const element of (junctionId === undefined
+      ? await sdk.DataModel.Junctions.getAll()
       : (function (junction) {
           return junction === undefined ? [] : [junction];
-        })(sdk.DataModel.Junctions.getById({ junctionId: junctionId }))
-    ).forEach(function (element) {
+        })(await sdk.DataModel.Junctions.getById({ junctionId: junctionId })))) {
       ja_log(element, 3);
-      var nodes = {};
-      element.segmentIds.forEach(function (s) {
-        var seg = sdk.DataModel.Segments.getById({ segmentId: s });
+      let nodes = {};
+      for (const s of (element.segmentIds)) {
+        let seg = await sdk.DataModel.Segments.getById({ segmentId: s });
         ja_log(seg, 3);
         // Guard against null node IDs (can happen with unsaved segments)
-        if (seg.fromNodeId) nodes[seg.fromNodeId] = sdk.DataModel.Nodes.getById({ nodeId: seg.fromNodeId });
-        if (seg.toNodeId) nodes[seg.toNodeId] = sdk.DataModel.Nodes.getById({ nodeId: seg.toNodeId });
-      });
+        if (seg.fromNodeId) nodes[seg.fromNodeId] = await sdk.DataModel.Nodes.getById({ nodeId: seg.fromNodeId });
+        if (seg.toNodeId) nodes[seg.toNodeId] = await sdk.DataModel.Nodes.getById({ nodeId: seg.toNodeId });
+      };
 
       ja_log(nodes, 3);
-      var center = element.geometry; // GeoJSON Point
+      let center = element.geometry; // GeoJSON Point
       ja_log(center, 3);
-      var distances = [];
+      let distances = [];
       Object.getOwnPropertyNames(nodes).forEach(function (name) {
         ja_log('Checking ' + name + ' distance', 3);
         // Skip if node is null or doesn't have geometry (unsaved segments can cause this)
@@ -2297,18 +2321,18 @@
       // Skip circle drawing if no valid nodes (all were null due to unsaved segments)
       if (distances.length === 0) {
         ja_log('No valid nodes for roundabout overlay (unsaved segments?)', 2);
-        return;
+        continue;
       }
-      var meanDistM =
+      let meanDistM =
         distances.reduce(function (a, b) {
           return a + b;
         }) / distances.length;
       ja_log('Mean distance is ' + meanDistM, 3);
 
-      var circleGeom = turf.circle(turf.point(center.coordinates), meanDistM / 1000, { steps: 40 }).geometry;
+      let circleGeom = turf.circle(turf.point(center.coordinates), meanDistM / 1000, { steps: 40 }).geometry;
       ja_roundabout_points.push(circleGeom);
-      ja_add_feature(circleGeom, { ja_type: 'roundaboutOverlay' });
-    });
+      await ja_add_feature(circleGeom, { ja_type: 'roundaboutOverlay' });
+    };
   }
 
   /*
@@ -2392,8 +2416,8 @@
    * @param {number} toSegmentId - ID of the median segment.
    * @returns {boolean}
    */
-  function ja_segment_has_lane_guidance(segmentId, nodeId, toSegmentId) {
-    var turns = sdk.DataModel.Turns.getTurnsFromSegment({ segmentId: segmentId, nodeId: nodeId });
+  async function ja_segment_has_lane_guidance(segmentId, nodeId, toSegmentId) {
+    var turns = await sdk.DataModel.Turns.getTurnsFromSegment({ segmentId: segmentId, nodeId: nodeId });
     if (!turns) return false;
     for (var i = 0; i < turns.length; i++) {
       if (turns[i].toSegmentId === toSegmentId && turns[i].lanes !== null) {
@@ -2433,8 +2457,8 @@
    * @param {Object} geometry - GeoJSON geometry object.
    * @param {Object} properties - Feature properties (must include ja_type).
    */
-  function ja_add_feature(geometry, properties) {
-    sdk.Map.addFeatureToLayer({
+  async function ja_add_feature(geometry, properties) {
+    await sdk.Map.addFeatureToLayer({
       layerName: 'junction_angles',
       feature: {
         id: 'ja_' + ++ja_feature_counter,
@@ -2524,13 +2548,13 @@
    * @param {Object} s_to - SDK Segment object for the outgoing road.
    * @returns {boolean} True if the turn is allowed for a typical passenger vehicle.
    */
-  function ja_is_turn_allowed(s_from, via_node, s_to) {
-    if (!sdk.DataModel.Turns.isTurnAllowedBySegmentDirections({ fromSegmentId: s_from.id, nodeId: via_node.id, toSegmentId: s_to.id })) {
+  async function ja_is_turn_allowed(s_from, via_node, s_to) {
+    if (!await sdk.DataModel.Turns.isTurnAllowedBySegmentDirections({ fromSegmentId: s_from.id, nodeId: via_node.id, toSegmentId: s_to.id })) {
       ja_log('Turn ' + s_from.id + ' → ' + s_to.id + ' via ' + via_node.id + ': blocked (direction)', 3);
       return false;
     }
 
-    var allowed = sdk.DataModel.Turns.isTurnAllowed({ fromSegmentId: s_from.id, nodeId: via_node.id, toSegmentId: s_to.id });
+    var allowed = await sdk.DataModel.Turns.isTurnAllowed({ fromSegmentId: s_from.id, nodeId: via_node.id, toSegmentId: s_to.id });
     ja_log('Turn ' + s_from.id + ' → ' + s_to.id + ' via ' + via_node.id + ': ' + (allowed ? 'allowed' : 'blocked'), 3);
     return allowed;
   }
@@ -2653,17 +2677,17 @@
    *   SDK Street object (or undefined if none) and `secondary` as an array of SDK Street objects
    *   for each alternate street.
    */
-  function ja_get_streets(segmentId) {
-    var segment = sdk.DataModel.Segments.getById({ segmentId: segmentId });
-    var primary = segment && segment.primaryStreetId != null ? sdk.DataModel.Streets.getById({ streetId: segment.primaryStreetId }) : undefined;
+  async function ja_get_streets(segmentId) {
+    var segment = await sdk.DataModel.Segments.getById({ segmentId: segmentId });
+    var primary = segment && segment.primaryStreetId != null ? await sdk.DataModel.Streets.getById({ streetId: segment.primaryStreetId }) : undefined;
     var secondary = [];
     if (segment) {
-      segment.alternateStreetIds.forEach(function (element) {
-        var street = sdk.DataModel.Streets.getById({ streetId: element });
+      for (const element of (segment.alternateStreetIds)) {
+        let street = await sdk.DataModel.Streets.getById({ streetId: element });
         if (street != null) {
           secondary.push(street);
         }
-      });
+      };
     }
     ja_log(primary, 3);
     ja_log(secondary, 3);
@@ -2773,27 +2797,27 @@
    *   deviation marker beyond the ring node).
    * @returns {boolean} True if all exits are within ±PERPENDICULAR_TOLERANCE° of perpendicular; false otherwise.
    */
-  function ja_is_roundabout_normal(junctionID, n_in, label_distance) {
+  async function ja_is_roundabout_normal(junctionID, n_in, label_distance) {
     ja_log('Check normal roundabout', 3);
-    var junction = sdk.DataModel.Junctions.getById({ junctionId: junctionID });
+    var junction = await sdk.DataModel.Junctions.getById({ junctionId: junctionID });
     var nodes = {};
     var numValidExits = 0;
-    junction.segmentIds.forEach(function (element, index) {
-      var s = sdk.DataModel.Segments.getById({ segmentId: element });
+    for (const [index, element] of (junction.segmentIds).entries()) {
+      let s = await sdk.DataModel.Segments.getById({ segmentId: element });
       ja_log('index: ' + index, 3);
       //ja_log(s, 3);
       if (!nodes.hasOwnProperty(s.toNodeId)) {
         ja_log('Adding node id: ' + s.toNodeId, 3);
         //Check if node has allowed exits
-        var allowed = false;
-        var currNode = sdk.DataModel.Nodes.getById({ nodeId: s.toNodeId });
+        let allowed = false;
+        let currNode = await sdk.DataModel.Nodes.getById({ nodeId: s.toNodeId });
         ja_log(currNode, 3);
-        currNode.connectedSegmentIds.forEach(function (element2) {
-          var s_exit = sdk.DataModel.Segments.getById({ segmentId: element2 });
+        for (const element2 of (currNode.connectedSegmentIds)) {
+          let s_exit = await sdk.DataModel.Segments.getById({ segmentId: element2 });
           ja_log(s_exit, 3);
           if (s_exit.junctionId === null) {
             ja_log('Checking: ' + s_exit.id, 3);
-            if (sdk.DataModel.Turns.isTurnAllowedBySegmentDirections({ fromSegmentId: s.id, nodeId: currNode.id, toSegmentId: s_exit.id })) {
+            if (await sdk.DataModel.Turns.isTurnAllowedBySegmentDirections({ fromSegmentId: s.id, nodeId: currNode.id, toSegmentId: s_exit.id })) {
               //Exit possibly allowed
               ja_log('Exit allowed', 3);
               allowed = true;
@@ -2804,13 +2828,13 @@
             //part of the junction.. Ignoring
             ja_log(s_exit.id + ' is in the roundabout. ignoring', 3);
           }
-        });
+        };
         if (allowed) {
           numValidExits++;
-          nodes[s.toNodeId] = sdk.DataModel.Nodes.getById({ nodeId: s.toNodeId });
+          nodes[s.toNodeId] = await sdk.DataModel.Nodes.getById({ nodeId: s.toNodeId });
         }
       }
-    });
+    };
 
     var is_normal = true;
     ja_log(n_in, 3);
@@ -2826,9 +2850,9 @@
           ja_log('Not comparing to n_in ;)', 3);
         } else {
           var angle = ja_angle_between_points(
-            sdk.DataModel.Nodes.getById({ nodeId: n_in }).geometry,
+            (await sdk.DataModel.Nodes.getById({ nodeId: n_in })).geometry,
             ja_coordinates_to_point(junction.geometry.coordinates),
-            sdk.DataModel.Nodes.getById({ nodeId: n_id }).geometry,
+            (await sdk.DataModel.Nodes.getById({ nodeId: n_id })).geometry,
           );
           ja_log('Angle is: ' + angle, 3);
           ja_log('Normalized angle is: ' + (angle % 90), 3);
@@ -2850,7 +2874,7 @@
             var ja_ld = ja_corrected_ld(label_distance, n_geom.coordinates);
             var angleMod = Math.abs(angle % 90);
             var marker_geom = turf.destination(turf.point(center_coord), ring_radius_km + ja_ld / 1000, bearing_out).geometry;
-            ja_add_feature(marker_geom, {
+            await ja_add_feature(marker_geom, {
               angle: '±' + ja_round(Math.min(angleMod, 90 - angleMod)),
               ja_type: ja_routing_type.ROUNDABOUT,
             });
@@ -2892,9 +2916,9 @@
    * @param {number} entryNodeId    - Node id where the selected entry segment meets the roundabout.
    * @param {number} label_distance - Current label-distance in meters (used to offset markers).
    */
-  function ja_draw_roundabout_entry_exits(junctionId, entryNodeId, label_distance) {
+  async function ja_draw_roundabout_entry_exits(junctionId, entryNodeId, label_distance) {
     ja_log('[RA-ENTRY] Called with junctionId=' + junctionId + ', entryNodeId=' + entryNodeId, 2);
-    var junction = sdk.DataModel.Junctions.getById({ junctionId: junctionId });
+    var junction = await sdk.DataModel.Junctions.getById({ junctionId: junctionId });
     if (!junction) {
       ja_log('[RA-ENTRY] Junction not found!', 2);
       return;
@@ -2904,7 +2928,7 @@
       ja_log('[RA-ENTRY] Entry node ID is null (unsaved segment?)', 2);
       return;
     }
-    var entryNode = sdk.DataModel.Nodes.getById({ nodeId: entryNodeId });
+    var entryNode = await sdk.DataModel.Nodes.getById({ nodeId: entryNodeId });
     if (!entryNode) {
       ja_log('[RA-ENTRY] Entry node not found!', 2);
       return;
@@ -2930,62 +2954,62 @@
 
     // Draw circle overlay if configured
     if (ja_getOption('roundaboutOverlayDisplay') === 'rOverSelected') {
-      ja_draw_roundabout_overlay(junctionId);
+      await ja_draw_roundabout_overlay(junctionId);
     }
 
     // Draw entry-leg: entry node → roundabout center
-    ja_add_feature({ type: 'LineString', coordinates: [entryNode.geometry.coordinates, center.coordinates] }, { ja_type: 'arrow_line' });
+    await ja_add_feature({ type: 'LineString', coordinates: [entryNode.geometry.coordinates, center.coordinates] }, { ja_type: 'arrow_line' });
 
     // ── Step 1: Collect all valid exits ──────────────────────────────────────
     var processedNodes = {};
     var exits = [];
 
     ja_log('[RA-ENTRY] Roundabout has ' + junction.segmentIds.length + ' segments', 2);
-    junction.segmentIds.forEach(function (segId) {
+    for (const segId of (junction.segmentIds)) {
       ja_log('[RA-ENTRY] Processing segment ' + segId, 3);
-      var juncSeg = sdk.DataModel.Segments.getById({ segmentId: segId });
-      if (!juncSeg) return;
+      let juncSeg = await sdk.DataModel.Segments.getById({ segmentId: segId });
+      if (!juncSeg) continue;
 
-      var exitNodeId = juncSeg.toNodeId;
+      let exitNodeId = juncSeg.toNodeId;
       // Skip segments with null node IDs (can happen with unsaved segments)
-      if (!exitNodeId) return;
+      if (!exitNodeId) continue;
 
       // Allow the entry node once (U-turn arc) but deduplicate everything else.
       // We track with a count so a second arc returning to the same node is still skipped.
-      if (processedNodes.hasOwnProperty(String(exitNodeId))) return;
+      if (processedNodes.hasOwnProperty(String(exitNodeId))) continue;
       processedNodes[String(exitNodeId)] = true;
 
-      var exitNode = sdk.DataModel.Nodes.getById({ nodeId: exitNodeId });
-      if (!exitNode) return;
+      let exitNode = await sdk.DataModel.Nodes.getById({ nodeId: exitNodeId });
+      if (!exitNode) continue;
 
       // Find the first exit segment at this node (not part of THIS roundabout, but may be part of another junction).
       // Validate that traffic can actually LEAVE the roundabout node (not one-way INTO it).
-      var exitSeg = null;
-      exitNode.connectedSegmentIds.forEach(function (connSegId) {
-        if (exitSeg) return;
-        var s = sdk.DataModel.Segments.getById({ segmentId: connSegId });
-        if (!s) return;
+      let exitSeg = null;
+      for (const connSegId of (exitNode.connectedSegmentIds)) {
+        if (exitSeg) continue;
+        let s = await sdk.DataModel.Segments.getById({ segmentId: connSegId });
+        if (!s) continue;
         // Skip segments that are part of THIS roundabout. Allow segments in other junctions or standalone.
         if (s.junctionId === junctionId) {
           ja_log('[RA-ENTRY]   Skipping ' + connSegId + ' (part of this RA)', 3);
-          return;
+          continue;
         }
         // Accept exit if it can leave this node. Reject only if it's explicitly one-way INTO the node.
         // Two-way segments (isAtoB !== isBtoA is false, meaning both true or both false) are always valid.
         // One-way FROM this node: (isAtoB && fromNodeId=this) OR (isBtoA && toNodeId=this)
         // One-way INTO this node (reject): (isAtoB && toNodeId=this) OR (isBtoA && fromNodeId=this)
-        var isOneWayInto = (s.isAtoB && s.toNodeId === exitNodeId && !s.isBtoA) || (s.isBtoA && s.fromNodeId === exitNodeId && !s.isAtoB);
+        let isOneWayInto = (s.isAtoB && s.toNodeId === exitNodeId && !s.isBtoA) || (s.isBtoA && s.fromNodeId === exitNodeId && !s.isAtoB);
         if (isOneWayInto) {
           ja_log('[RA-ENTRY]   Skipping ' + connSegId + ' (one-way INTO roundabout only)', 2);
-          return;
+          continue;
         }
 
         // Check for locally-set turn restrictions at this exit.
         // Query all turns ending at the exit segment — if any are marked as not allowed, mark the exit as restricted.
-        var arcPath = ja_get_roundabout_arc_path(junctionId, entryNodeId, exitNodeId);
-        var isRestricted = false;
+        let arcPath = await ja_get_roundabout_arc_path(junctionId, entryNodeId, exitNodeId);
+        let isRestricted = false;
         if (arcPath) {
-          isRestricted = ja_check_roundabout_arc_restricted(arcPath, s);
+          isRestricted = await ja_check_roundabout_arc_restricted(arcPath, s);
         }
 
         if (isRestricted) {
@@ -2995,27 +3019,27 @@
 
         ja_log('[RA-ENTRY]   Accepting exit ' + connSegId + (isRestricted ? ' (RESTRICTED)' : ''), 3);
         exitSeg = s;
-      });
+      };
       if (!exitSeg) {
-        var debugSegs = 'connected segs: ';
-        exitNode.connectedSegmentIds.forEach(function (cid) {
-          var cs = sdk.DataModel.Segments.getById({ segmentId: cid });
+        let debugSegs = 'connected segs: ';
+        for (const cid of (exitNode.connectedSegmentIds)) {
+          let cs = await sdk.DataModel.Segments.getById({ segmentId: cid });
           if (cs) {
             debugSegs += cid + '(jID=' + (cs.junctionId || 'null') + ') ';
           }
-        });
+        };
         ja_log('[RA-ENTRY] Node ' + exitNodeId + ' has no valid exit. ' + debugSegs, 2);
-        return;
+        continue;
       }
 
       // CCW angle (0–360°) from entry to this exit, measured at the roundabout center.
       // In right-hand traffic (CCW roundabout): ~90° = Turn Right, ~180° = Straight, ~270° = Turn Left.
       // U-turn arc returns to the entry node — assign 360 so it sorts last and falls in the ≥315 U-turn bucket.
-      var ccwAngle;
+      let ccwAngle;
       if (exitNodeId === entryNodeId) {
         ccwAngle = 360;
       } else {
-        var bearingToExit = turf.bearing(centerPt, turf.point(exitNode.geometry.coordinates));
+        let bearingToExit = turf.bearing(centerPt, turf.point(exitNode.geometry.coordinates));
         ccwAngle = (bearingToEntry - bearingToExit + 360) % 360;
         ja_log(
           '[RA-DEBUG] exitNodeId=' +
@@ -3036,13 +3060,13 @@
       // Triangle angle at center: entry_node → center → exit_node (always 0–180°).
       // U-turn arc: entry and exit are the same node so the triangle is degenerate (0°).
       // Use 180° instead — the driver exits back along the same road in the opposite direction.
-      var triAngle = exitNodeId === entryNodeId ? 180 : ja_angle_between_points(entryNode.geometry, center, exitNode.geometry);
-      var isExitAngleNormal = ja_is_angle_normal(triAngle);
+      let triAngle = exitNodeId === entryNodeId ? 180 : ja_angle_between_points(entryNode.geometry, center, exitNode.geometry);
+      let isExitAngleNormal = ja_is_angle_normal(triAngle);
 
       // Skip exits with invalid angles (can happen with unsaved segments)
       if (isNaN(ccwAngle) || isNaN(triAngle)) {
         ja_log('[RA-ENTRY] Skipping exit with NaN angle: ccwAngle=' + ccwAngle + ', triAngle=' + triAngle, 2);
-        return;
+        continue;
       }
 
       exits.push({
@@ -3054,7 +3078,7 @@
         triAngle: triAngle,
         isExitAngleNormal: isExitAngleNormal,
       });
-    });
+    };
 
     ja_log('[RA-ENTRY] Collected ' + exits.length + ' exits', 2);
     if (exits.length === 0) {
@@ -3071,22 +3095,22 @@
 
     // Criterion 2 – Total junction node count 2–4
     var junctionNodeSet = {};
-    junction.segmentIds.forEach(function (segId) {
-      var s = sdk.DataModel.Segments.getById({ segmentId: segId });
+    for (const segId of (junction.segmentIds)) {
+      let s = await sdk.DataModel.Segments.getById({ segmentId: segId });
       // Skip segments with null node IDs (unsaved segments)
       if (s && s.toNodeId) junctionNodeSet[String(s.toNodeId)] = true;
-    });
+    };
     var totalJunctionNodes = Object.keys(junctionNodeSet).length;
     var isNodeCountNormal = totalJunctionNodes >= 2 && totalJunctionNodes <= 4;
 
     // Criterion 3 – Maximum distance from center to any junction node ≤ 25 m
     var maxRadius = 0;
-    Object.keys(junctionNodeSet).forEach(function (nid) {
-      var n = sdk.DataModel.Nodes.getById({ nodeId: parseInt(nid, 10) });
-      if (!n) return;
-      var r = turf.distance(centerPt, turf.point(n.geometry.coordinates)) * 1000; // km→m
+    for (const nid of (Object.keys(junctionNodeSet))) {
+      let n = await sdk.DataModel.Nodes.getById({ nodeId: parseInt(nid, 10) });
+      if (!n) continue;
+      let r = turf.distance(centerPt, turf.point(n.geometry.coordinates)) * 1000; // km→m
       if (r > maxRadius) maxRadius = r;
-    });
+    };
     var isRadiusNormal = maxRadius <= 25;
 
     var isRoundaboutNormal = allAnglesNormal && isNodeCountNormal && isRadiusNormal;
@@ -3101,7 +3125,7 @@
     // White = radius ≤ 25 m (Normal criterion met); Orange = radius > 25 m (Non-Normal).
     var diameterM = ja_round(maxRadius * 2);
     var diameterLabel = ja_getOption('angleDisplay') === 'displaySimple' ? '\u00d8' + diameterM + 'm' : '\u00d8\n' + diameterM + 'm';
-    ja_add_feature(center, {
+    await ja_add_feature(center, {
       angle: diameterLabel,
       ja_type: isRadiusNormal ? ja_routing_type.BC : ja_routing_type.ROUNDABOUT,
     });
@@ -3134,30 +3158,30 @@
 
     // ── Step 4: Draw exit legs and markers ───────────────────────────────────
     var validExitOrdinal = 0; // Counter for non-normal roundabouts (skips restricted exits)
-    exits.forEach(function (exit, index) {
+    for (const [index, exit] of exits.entries()) {
       // Draw exit leg: roundabout center → exit node
-      ja_add_feature({ type: 'LineString', coordinates: [center.coordinates, exit.exitNode.geometry.coordinates] }, { ja_type: 'arrow_line' });
+      await ja_add_feature({ type: 'LineString', coordinates: [center.coordinates, exit.exitNode.geometry.coordinates] }, { ja_type: 'arrow_line' });
 
-      var exitBearing = ja_getAngle(exit.exitNodeId, exit.exitSeg);
-      var exitLd = ja_corrected_ld(label_distance, exit.exitNode.geometry.coordinates);
-      var point = turf.destination(turf.point(exit.exitNode.geometry.coordinates), (exitLd * 2) / 1000, ja_math_to_compass(exitBearing)).geometry;
+      let exitBearing = ja_getAngle(exit.exitNodeId, exit.exitSeg);
+      let exitLd = ja_corrected_ld(label_distance, exit.exitNode.geometry.coordinates);
+      let point = turf.destination(turf.point(exit.exitNode.geometry.coordinates), (exitLd * 2) / 1000, ja_math_to_compass(exitBearing)).geometry;
 
       // Check if this exit has a turn restriction
-      var isRestricted = exit.exitSeg._isRestricted === true;
+      let isRestricted = exit.exitSeg._isRestricted === true;
 
-      var markerType;
+      let markerType;
       if (isRestricted) {
         // Restricted exit: always display as NO_TURN (gray)
         markerType = ja_routing_type.NO_TURN;
         ja_log('[RA-DEBUG] Drawing restricted exit ' + index + ': nodeId=' + exit.exitNodeId + ', markerType=NO_TURN', 2);
-        ja_draw_marker(point, exit.exitNode, exitLd, exit.triAngle, exitBearing, true, markerType);
+        await ja_draw_marker(point, exit.exitNode, exitLd, exit.triAngle, exitBearing, true, markerType);
       } else if (isRoundaboutNormal) {
         // Normal roundabout with allowed exit: classify by CCW angle from entry
         //   ~90°  → Turn Right   (first exit going CCW)
         //   ~180° → Continue Straight
         //   ~270° → Turn Left    (last exit before U-turn)
         //   ~0°/360° → U-Turn
-        var ccw = exit.ccwAngle;
+        let ccw = exit.ccwAngle;
         if (ccw < ROUNDABOUT_INSTRUCTION_UTURN_THRESHOLD || ccw >= ROUNDABOUT_INSTRUCTION_TURN_LEFT_THRESHOLD) {
           markerType = ja_routing_type.U_TURN;
         } else if (ccw < ROUNDABOUT_INSTRUCTION_TURN_RIGHT_THRESHOLD) {
@@ -3170,19 +3194,19 @@
         ja_log('[RA-DEBUG] Drawing exit ' + index + ': nodeId=' + exit.exitNodeId + ', ccw=' + ja_round(ccw) + '°, markerType=' + markerType, 2);
         // ja_draw_marker handles arrow characters and display-mode formatting,
         // exactly as it does for regular turn markers at intersections.
-        ja_draw_marker(point, exit.exitNode, exitLd, exit.triAngle, exitBearing, true, markerType);
+        await ja_draw_marker(point, exit.exitNode, exitLd, exit.triAngle, exitBearing, true, markerType);
       } else {
         // Non-normal roundabout: ordinal exit numbers in encounter order (skipping restricted exits)
         // Only increment counter for allowed exits; restricted exits get NO_TURN marker
         validExitOrdinal++;
         ja_log('[RA-DEBUG] Drawing non-normal exit ' + index + ': nodeId=' + exit.exitNodeId + ', ordinal=' + validExitOrdinal, 2);
         // Direct feature add — ordinal string can't pass through ja_draw_marker's numeric 'a'.
-        ja_add_feature(point, {
+        await ja_add_feature(point, {
           angle: ja_getOption('angleDisplay') === 'displaySimple' ? ordinal(validExitOrdinal) + ' ' + ja_round(exit.triAngle) + '°' : ordinal(validExitOrdinal) + '\n' + ja_round(exit.triAngle) + '°',
           ja_type: ja_routing_type.ROUNDABOUT, // "Non-Normal Exit Color" (roundaboutColor) setting
         });
       }
-    });
+    };
   }
 
   /**
@@ -3197,8 +3221,8 @@
    * @param {number} exitNodeId - Ending node ID.
    * @returns {Object[]|null} Array of SDK Segment objects forming the path, or null if path cannot be constructed.
    */
-  function ja_get_roundabout_arc_path(junctionId, entryNodeId, exitNodeId) {
-    var junction = sdk.DataModel.Junctions.getById({ junctionId: junctionId });
+  async function ja_get_roundabout_arc_path(junctionId, entryNodeId, exitNodeId) {
+    var junction = await sdk.DataModel.Junctions.getById({ junctionId: junctionId });
     if (!junction) return null;
 
     var path = [];
@@ -3214,7 +3238,7 @@
         var segId = junction.segmentIds[i];
         if (visited[String(segId)]) continue;
 
-        var seg = sdk.DataModel.Segments.getById({ segmentId: segId });
+        var seg = await sdk.DataModel.Segments.getById({ segmentId: segId });
         if (!seg) continue;
 
         if (seg.fromNodeId === currentNodeId) {
@@ -3249,12 +3273,12 @@
    * @param {Object} s_to - SDK Segment object for the outgoing road.
    * @returns {boolean} True if a turn restriction explicitly blocks this turn.
    */
-  function ja_is_turn_restricted(s_to) {
+  async function ja_is_turn_restricted(s_to) {
     try {
       // Query all turns ending at the exit segment and check if ANY are restricted.
       // This avoids depending on exact arc path construction — we just need to know
       // if there's a restricted turn to this exit from ANY arc segment.
-      var turnsTo = sdk.DataModel.Turns.getTurnsToSegment({ segmentId: s_to.id });
+      var turnsTo = await sdk.DataModel.Turns.getTurnsToSegment({ segmentId: s_to.id });
 
       if (turnsTo && turnsTo.length > 0) {
         for (var j = 0; j < turnsTo.length; j++) {
@@ -3285,7 +3309,7 @@
    * @param {Object} exitSegment - The exit segment (where traffic leaves the roundabout).
    * @returns {boolean} true if ANY step in the path is restricted, false if all steps allowed.
    */
-  function ja_check_roundabout_arc_restricted(arcPath, exitSegment) {
+  async function ja_check_roundabout_arc_restricted(arcPath, exitSegment) {
     if (!arcPath || arcPath.length === 0 || !exitSegment) {
       ja_log('[RA-PATH-CHECK] Invalid input: arcPath=' + (arcPath ? arcPath.length : 'null') + ', exitSeg=' + (exitSegment ? 'yes' : 'null'), 2);
       return false;
@@ -3310,13 +3334,13 @@
       }
 
       // Fetch the node (defensive check)
-      var stepConnectingNode = sdk.DataModel.Nodes.getById({ nodeId: stepConnectingNodeId });
+      var stepConnectingNode = await sdk.DataModel.Nodes.getById({ nodeId: stepConnectingNodeId });
       if (!stepConnectingNode) {
         return true; // Node not found
       }
 
       // Check for explicit turn restrictions at this exit
-      return ja_is_turn_restricted(stepTo);
+      return await ja_is_turn_restricted(stepTo);
     }
 
     return false;
@@ -3724,7 +3748,7 @@
    * @param {number} localStepAngle - The angle at the connecting node (fallback if guess fails).
    * @returns {string} A ja_routing_type value for styling/display.
    */
-  function ja_get_final_step_type(turn, connectingNode, lastPathSegId, lastPathSeg, exitSeg, localStepAngle) {
+  async function ja_get_final_step_type(turn, connectingNode, lastPathSegId, lastPathSeg, exitSeg, localStepAngle) {
     // Step 1: Check for TIO/VIO override (turn.instructionOpCode)
     var opcode = turn.instructionOpCode || null;
     if (opcode) {
@@ -3735,7 +3759,7 @@
     }
 
     // Step 2: Check if exit is restricted (local node turn restriction)
-    if (!ja_is_turn_allowed(lastPathSeg, connectingNode, exitSeg)) {
+    if (!await ja_is_turn_allowed(lastPathSeg, connectingNode, exitSeg)) {
       ja_log('[FAR-TURNS] Final step blocked by turn restriction', 2);
       return ja_routing_type.NO_TURN;
     }
@@ -3744,14 +3768,14 @@
     if (connectingNode) {
       // Build angles array for ja_guess_routing_instruction
       var guessAngles = [];
-      connectingNode.connectedSegmentIds.forEach(function (cSegId) {
-        var cSeg = sdk.DataModel.Segments.getById({ segmentId: cSegId });
-        var cAngle = ja_getAngle(connectingNode.id, cSeg);
+      for (const cSegId of (connectingNode.connectedSegmentIds)) {
+        let cSeg = await sdk.DataModel.Segments.getById({ segmentId: cSegId });
+        let cAngle = ja_getAngle(connectingNode.id, cSeg);
         if (cAngle != null) {
           guessAngles.push([cAngle, cSegId, false]);
         }
-      });
-      var guessed = ja_guess_routing_instruction(connectingNode, lastPathSegId, exitSeg.id, guessAngles);
+      };
+      var guessed = await ja_guess_routing_instruction(connectingNode, lastPathSegId, exitSeg.id, guessAngles);
       if (guessed !== ja_routing_type.NO_TURN) {
         return guessed;
       }
@@ -3826,7 +3850,7 @@
    *                                    ja_guess_routing_instruction() so far-turn classification
    *                                    uses the same KEEP/EXIT/TURN thresholds as regular turns.
    */
-  function ja_draw_far_turn_markers(node, ja_label_distance, ja_selected_seg_ids, allBigJunctions) {
+  async function ja_draw_far_turn_markers(node, ja_label_distance, ja_selected_seg_ids, allBigJunctions) {
     ja_log('[FAR-TURNS] Processing node ' + node.id + ' (' + node.connectedSegmentIds.length + ' segments)', 4);
 
     // WHY getTurnsFromSegment instead of getTurnsThroughNode:
@@ -3842,7 +3866,7 @@
     var seenTurnIds = {}; // deduplicate in case two connected segments share a far turn
     var drawnIntermediateSteps = {}; // key: "nodeId_angleRounded", prevents duplicate intermediate-step markers when multiple paths share the same median segment
 
-    node.connectedSegmentIds.forEach(function (segId) {
+    for (const segId of (node.connectedSegmentIds)) {
       // Only draw far turns FROM the user-selected entry segment(s).
       //
       // When a segment is selected, regular departure-mode markers show angles FROM that
@@ -3859,42 +3883,42 @@
       // single "incoming" segment to anchor the perspective.
       if (ja_selected_seg_ids.length > 0 && ja_selected_seg_ids.indexOf(segId) === -1) {
         ja_log('Skip segment ' + segId + ' (not selected)', 4);
-        return;
+        continue;
       }
 
       // Skip segments that are contained within a BigJunction (median/intermediate segments).
-      if (sdk.DataModel.Segments.isContainedInBigJunction({ segmentId: segId })) {
+      if (await sdk.DataModel.Segments.isContainedInBigJunction({ segmentId: segId })) {
         ja_log('Skip segment ' + segId + ' (median)', 4);
-        return;
+        continue;
       }
 
       // Get direct turns from this segment
-      var turnsFromSeg = sdk.DataModel.Turns.getTurnsFromSegment({ segmentId: segId });
-      if (!turnsFromSeg || turnsFromSeg.length === 0) return;
+      let turnsFromSeg = await sdk.DataModel.Turns.getTurnsFromSegment({ segmentId: segId });
+      if (!turnsFromSeg || turnsFromSeg.length === 0) continue;
 
       // Check if this segment has far turns (JB or Path) via the normal method
-      var jbFarTurnsCount = turnsFromSeg.filter(function (t) {
+      let jbFarTurnsCount = turnsFromSeg.filter(function (t) {
         return t.isJunctionBoxTurn || t.isPathTurn;
       }).length;
 
       // FALLBACK: If no far turns (JB or Path) found, try getAllPossibleTurns() as alternative
       if (jbFarTurnsCount === 0) {
         // Check if this segment crosses into a BigJunction and if we're at the correct entry node
-        var seg = sdk.DataModel.Segments.getById({ segmentId: segId });
+        let seg = await sdk.DataModel.Segments.getById({ segmentId: segId });
         if (seg) {
-          var fromNode = sdk.DataModel.Nodes.getById({ nodeId: seg.fromNodeId });
-          var toNode = sdk.DataModel.Nodes.getById({ nodeId: seg.toNodeId });
+          let fromNode = await sdk.DataModel.Nodes.getById({ nodeId: seg.fromNodeId });
+          let toNode = await sdk.DataModel.Nodes.getById({ nodeId: seg.toNodeId });
 
           if (fromNode && toNode) {
-            var isJBSegment = false;
-            var entryNodeForTurns = null;
+            let isJBSegment = false;
+            let entryNodeForTurns = null;
 
             // Determine if segment crosses JB boundary and which node is the entry node
-            for (var bji = 0; bji < allBigJunctions.length; bji++) {
+            for (let bji = 0; bji < allBigJunctions.length; bji++) {
               var bj = allBigJunctions[bji];
-              var bjPolygon = turf.polygon(bj.geometry.coordinates);
-              var fromInside = turf.booleanPointInPolygon(turf.point(fromNode.geometry.coordinates), bjPolygon);
-              var toInside = turf.booleanPointInPolygon(turf.point(toNode.geometry.coordinates), bjPolygon);
+              let bjPolygon = turf.polygon(bj.geometry.coordinates);
+              let fromInside = turf.booleanPointInPolygon(turf.point(fromNode.geometry.coordinates), bjPolygon);
+              let toInside = turf.booleanPointInPolygon(turf.point(toNode.geometry.coordinates), bjPolygon);
 
               // Check if segment crosses JB boundary (entry: outside→inside, exit: inside→outside)
               if ((!fromInside && toInside) || (fromInside && !toInside)) {
@@ -3908,33 +3932,38 @@
             // Only query getAllPossibleTurns when we're at the correct entry node
             if (isJBSegment && entryNodeForTurns === node.id) {
               try {
-                var allTurns = sdk.DataModel.BigJunctions.getAllPossibleTurns({ bigJunctionId: bj.id });
+                let allTurns = await sdk.DataModel.BigJunctions.getAllPossibleTurns({ bigJunctionId: bj.id });
                 ja_log('[FAR-TURNS] Fallback getAllPossibleTurns: ' + allTurns.length + ' turns found', 3);
 
                 // Filter for turns from this entry segment that have intermediate segments (far turns through JB)
                 // CRITICAL: getAllPossibleTurns() returns ALL path combinations through a JB, including
                 // traversals of median segments in BOTH directions. We must reject nonsensical paths.
-                var fallbackTurns = allTurns.filter(function (t) {
+                // Sequential loop: each candidate awaits SDK lookups, so Array.filter can't take an async predicate
+                let fallbackTurns = [];
+                for (const t of allTurns) {
                   if (!(t.fromSegmentId === segId && t.segmentPath && t.segmentPath.length > 0)) {
-                    return false;
+                    continue;
                   }
 
                   // REJECT: paths that traverse the same segment multiple times
                   // These are backtrack/loop paths and geometrically invalid
                   var pathSegIds = t.segmentPath;
+                  var consecutiveRepeat = false;
                   for (var psi = 0; psi < pathSegIds.length - 1; psi++) {
                     if (pathSegIds[psi] === pathSegIds[psi + 1]) {
                       ja_log('[FAR-TURNS] Rejecting turn ' + t.id + ' — same segment ' + pathSegIds[psi] + ' appears consecutively in path', 3);
-                      return false;
+                      consecutiveRepeat = true;
+                      break;
                     }
                   }
+                  if (consecutiveRepeat) continue;
 
-                  var tFromSeg = sdk.DataModel.Segments.getById({ segmentId: t.fromSegmentId });
-                  var tFirstPathSeg = sdk.DataModel.Segments.getById({ segmentId: t.segmentPath[0] });
-                  if (tFromSeg == null || tFirstPathSeg == null) return false;
+                  var tFromSeg = await sdk.DataModel.Segments.getById({ segmentId: t.fromSegmentId });
+                  var tFirstPathSeg = await sdk.DataModel.Segments.getById({ segmentId: t.segmentPath[0] });
+                  if (tFromSeg == null || tFirstPathSeg == null) continue;
 
                   var tEntryNode = ja_get_connecting_node(tFromSeg, tFirstPathSeg);
-                  if (tEntryNode !== entryNodeForTurns) return false;
+                  if (tEntryNode !== entryNodeForTurns) continue;
 
                   // Determine which node of firstPathSeg is the "exit" (not the entry)
                   var firstPathExitNode = null;
@@ -3943,26 +3972,26 @@
                   } else if (tFirstPathSeg.toNodeId === entryNodeForTurns) {
                     firstPathExitNode = tFirstPathSeg.fromNodeId; // traverse toward fromNodeId
                   } else {
-                    return false; // doesn't touch entry node
+                    continue; // doesn't touch entry node
                   }
 
                   // Now check: if there's a second segment in the path, it should connect
                   // from firstPathExitNode. If it doesn't, this traversal direction is wrong.
                   if (t.segmentPath.length > 1) {
-                    var tSecondPathSeg = sdk.DataModel.Segments.getById({ segmentId: t.segmentPath[1] });
-                    if (tSecondPathSeg == null) return false;
+                    var tSecondPathSeg = await sdk.DataModel.Segments.getById({ segmentId: t.segmentPath[1] });
+                    if (tSecondPathSeg == null) continue;
 
                     // Check if secondPathSeg connects to firstPathExitNode
                     if (tSecondPathSeg.fromNodeId !== firstPathExitNode && tSecondPathSeg.toNodeId !== firstPathExitNode) {
                       // Second segment doesn't connect to exit of first segment
                       // This indicates wrong traversal direction through first segment
                       ja_log('[FAR-TURNS] Rejecting turn ' + t.id + ' — path breaks at first→second segment connection', 3);
-                      return false;
+                      continue;
                     }
                   }
 
-                  return true;
-                });
+                  fallbackTurns.push(t);
+                }
 
                 ja_log('[FAR-TURNS] Filtered to ' + fallbackTurns.length + ' far turns FROM entry segment ' + segId, 2);
 
@@ -3975,13 +4004,13 @@
               }
             } else if (isJBSegment && entryNodeForTurns !== node.id) {
               ja_log('[FAR-TURNS] Segment ' + segId + ' is a JB segment, but entry node is ' + entryNodeForTurns + ', not current node ' + node.id + ' — skipping', 3);
-              return; // Skip this segment at this node
+              continue; // Skip this segment at this node
             }
           }
         }
       }
 
-      turnsFromSeg.forEach(function (turn) {
+      for (const turn of turnsFromSeg) {
         ja_log('[FAR-TURNS] Turn ' + turn.id + ': isPathTurn=' + turn.isPathTurn + ', isJunctionBoxTurn=' + turn.isJunctionBoxTurn, 3);
 
         // Only process far turns (Path turns or Junction Box turns).
@@ -3989,10 +4018,10 @@
         // by the existing ja_draw_node_markers() loop and should not be duplicated here.
         // Also accept turns with intermediate segments (from getAllPossibleTurns fallback)
         // even if they don't have the isJunctionBoxTurn flag set.
-        var isFarTurn = turn.isPathTurn || turn.isJunctionBoxTurn || (turn.segmentPath && turn.segmentPath.length > 0);
+        let isFarTurn = turn.isPathTurn || turn.isJunctionBoxTurn || (turn.segmentPath && turn.segmentPath.length > 0);
         if (!isFarTurn) {
           ja_log('[FAR-TURNS] Skipping turn ' + turn.id + ' — not a far turn', 3);
-          return;
+          continue;
         }
 
         // segmentPath[] contains the IDs of the intermediate segments connecting
@@ -4001,33 +4030,33 @@
         // somehow empty we cannot determine the entry node, so skip.
         if (!turn.segmentPath || turn.segmentPath.length === 0) {
           ja_log('[FAR-TURNS] Skipping far turn ' + turn.id + ' — segmentPath is empty', 1);
-          return;
+          continue;
         }
 
         // Fetch the entry segment for this far turn.
-        var fromSeg = sdk.DataModel.Segments.getById({ segmentId: turn.fromSegmentId });
+        let fromSeg = await sdk.DataModel.Segments.getById({ segmentId: turn.fromSegmentId });
         if (fromSeg == null) {
           ja_log('[FAR-TURNS] Skipping far turn ' + turn.id + ' — fromSegment not found', 1);
-          return;
+          continue;
         }
 
         // For fallback turns from getAllPossibleTurns(): verify path orientation.
         // getAllPossibleTurns() returns paths using median segments in both forward and
         // reverse directions. We must skip paths that traverse median segments backward.
-        var isFallbackTurn = !turn.isJunctionBoxTurn && turn.segmentPath && turn.segmentPath.length > 0;
+        let isFallbackTurn = !turn.isJunctionBoxTurn && turn.segmentPath && turn.segmentPath.length > 0;
         if (isFallbackTurn) {
-          var firstPathSegId = turn.segmentPath[0];
-          var firstPathSeg = sdk.DataModel.Segments.getById({ segmentId: firstPathSegId });
+          let firstPathSegId = turn.segmentPath[0];
+          let firstPathSeg = await sdk.DataModel.Segments.getById({ segmentId: firstPathSegId });
           if (firstPathSeg == null) {
             ja_log('[FAR-TURNS] Skipping fallback turn ' + turn.id + ' — firstPathSeg not found', 1);
-            return;
+            continue;
           }
           // Check if fromSeg actually connects to firstPathSeg. If no connection exists,
           // it means the path uses a segment in the wrong (backward) orientation.
-          var testConnectNode = ja_get_connecting_node(fromSeg, firstPathSeg);
+          let testConnectNode = ja_get_connecting_node(fromSeg, firstPathSeg);
           if (testConnectNode == null) {
             ja_log('[FAR-TURNS] Skipping fallback turn ' + turn.id + ' — cannot connect to first path segment (wrong orientation)', 3);
-            return;
+            continue;
           }
         }
 
@@ -4044,40 +4073,40 @@
         // Fix: The true entry node is the node shared between fromSegment and the FIRST
         // segment in segmentPath[]. That is the point where the segment physically hands off
         // into the JB or path. If the current node is not that shared node, skip this turn.
-        var firstPathSeg = sdk.DataModel.Segments.getById({ segmentId: turn.segmentPath[0] });
+        let firstPathSeg = await sdk.DataModel.Segments.getById({ segmentId: turn.segmentPath[0] });
         if (firstPathSeg == null) {
           ja_log('[FAR-TURNS] Skipping far turn ' + turn.id + ' — firstPathSeg not found', 1);
-          return;
+          continue;
         }
-        var entryNodeId = ja_get_connecting_node(fromSeg, firstPathSeg);
+        let entryNodeId = ja_get_connecting_node(fromSeg, firstPathSeg);
         if (entryNodeId !== node.id) {
           // This node is not the JB/path entry — the far turn belongs to the other end.
           ja_log('[FAR-TURNS] Skipping far turn ' + turn.id + ' at node ' + node.id + ' — entry is at node ' + entryNodeId, 3);
-          return;
+          continue;
         }
 
         // Deduplicate: a far turn may appear in results for multiple connected segments.
         // Only draw it once per node visit. This is checked AFTER node validation so that
         // fallback turns (which are node-specific) can be processed from their correct node
         // even if they were encountered and skipped from a different node first.
-        if (seenTurnIds[turn.id]) return;
+        if (seenTurnIds[turn.id]) continue;
         seenTurnIds[turn.id] = true;
 
         // Check if this turn type is enabled via experimental settings
         if (turn.isJunctionBoxTurn && !ja_getOption('enableFarTurnJB')) {
           ja_log('[FAR-TURNS] Skipping JB turn ' + turn.id + ' — enableFarTurnJB is disabled', 3);
-          return;
+          continue;
         }
         if (turn.isPathTurn && !ja_getOption('enableFarTurnPath')) {
           ja_log('[FAR-TURNS] Skipping Path turn ' + turn.id + ' — enableFarTurnPath is disabled', 3);
-          return;
+          continue;
         }
 
         // Fetch the exit segment (NOT connected to this node — it is at the far end of the path).
-        var toSeg = sdk.DataModel.Segments.getById({ segmentId: turn.toSegmentId });
+        let toSeg = await sdk.DataModel.Segments.getById({ segmentId: turn.toSegmentId });
         if (toSeg == null) {
           ja_log('[FAR-TURNS] Skipping far turn ' + turn.id + ' — toSegment not found', 1);
-          return;
+          continue;
         }
 
         // Skip JB turns whose exit segment is itself contained inside a BigJunction.
@@ -4094,36 +4123,36 @@
         // Note: this check is only applied to JB turns (isJunctionBoxTurn) because Path
         // turns (isPathTurn) do not use BigJunctions and their exit segments are always
         // external by definition.
-        if (turn.isJunctionBoxTurn && sdk.DataModel.Segments.isContainedInBigJunction({ segmentId: turn.toSegmentId })) {
+        if (turn.isJunctionBoxTurn && await sdk.DataModel.Segments.isContainedInBigJunction({ segmentId: turn.toSegmentId })) {
           ja_log('[FAR-TURNS] Skipping JB turn ' + turn.id + ' — toSegment ' + turn.toSegmentId + ' is a median (isContainedInBigJunction)', 1);
-          return;
+          continue;
         }
 
         // To get the correct departure bearing of the exit segment we need to know which
         // of its two endpoint nodes connects to the path. That is the node shared between
         // the last intermediate segment (segmentPath[last]) and the exit segment.
-        var lastPathSegId = turn.segmentPath[turn.segmentPath.length - 1];
-        var lastPathSeg = sdk.DataModel.Segments.getById({ segmentId: lastPathSegId });
+        let lastPathSegId = turn.segmentPath[turn.segmentPath.length - 1];
+        let lastPathSeg = await sdk.DataModel.Segments.getById({ segmentId: lastPathSegId });
         if (lastPathSeg == null) {
           ja_log('[FAR-TURNS] Skipping far turn ' + turn.id + ' — lastPathSeg not found', 1);
-          return;
+          continue;
         }
 
         // The connecting node is where the path "hands off" to the exit segment.
         // ja_getAngle() uses this to know which end of the exit segment faces the path.
-        var connectingNodeId = ja_get_connecting_node(lastPathSeg, toSeg);
+        let connectingNodeId = ja_get_connecting_node(lastPathSeg, toSeg);
         if (connectingNodeId == null) {
           ja_log('[FAR-TURNS] Skipping far turn ' + turn.id + ' — could not find connecting node between lastPathSeg and toSeg', 1);
-          return;
+          continue;
         }
 
         // BUILD PATH SEGMENTS ARRAY
         // ──────────────────────────────────────────────────────────────────
         // pathSegs = [fromSeg, segmentPath[0], ..., segmentPath[last], toSeg]
-        var pathSegs = [fromSeg];
-        var pathSegFetchOk = true;
-        for (var pi = 0; pi < turn.segmentPath.length; pi++) {
-          var pSeg = sdk.DataModel.Segments.getById({ segmentId: turn.segmentPath[pi] });
+        let pathSegs = [fromSeg];
+        let pathSegFetchOk = true;
+        for (let pi = 0; pi < turn.segmentPath.length; pi++) {
+          let pSeg = await sdk.DataModel.Segments.getById({ segmentId: turn.segmentPath[pi] });
           if (pSeg == null) {
             pathSegFetchOk = false;
             break;
@@ -4134,7 +4163,7 @@
 
         if (!pathSegFetchOk) {
           ja_log('[FAR-TURNS] Skipping turn ' + turn.id + ' — could not fetch all path segments', 1);
-          return;
+          continue;
         }
 
         // BREADCRUMB TRAIL: Draw a marker for each step in the path
@@ -4145,8 +4174,8 @@
 
         // Check restriction state: can be blocked at turn level (JB/Path) or at intermediate nodes
         // Track this so we can display gray marker instead of skipping entirely (for consistency with local turns)
-        var isPathRestricted = false;
-        var isFallbackJBTurn = !turn.isJunctionBoxTurn && !turn.isPathTurn && turn.segmentPath && turn.segmentPath.length > 0;
+        let isPathRestricted = false;
+        let isFallbackJBTurn = !turn.isJunctionBoxTurn && !turn.isPathTurn && turn.segmentPath && turn.segmentPath.length > 0;
 
         // First check: Turn restriction set directly on the turn (JB or Path turns)
         // Both turn types now support restrictions
@@ -4168,26 +4197,26 @@
         }
 
         // Build blockedSteps map for JB turns and fallback JB turns (check local node restrictions)
-        var blockedSteps = {};
-        var pathHasBlockedStep = false; // Track if ANY step is blocked
+        let blockedSteps = {};
+        let pathHasBlockedStep = false; // Track if ANY step is blocked
         if (turn.isJunctionBoxTurn || isFallbackJBTurn) {
-          for (var si = 0; si < pathSegs.length - 1; si++) {
-            var stepFrom = pathSegs[si];
-            var stepTo = pathSegs[si + 1];
-            var stepNodeId = ja_get_connecting_node(stepFrom, stepTo);
+          for (let si = 0; si < pathSegs.length - 1; si++) {
+            let stepFrom = pathSegs[si];
+            let stepTo = pathSegs[si + 1];
+            let stepNodeId = ja_get_connecting_node(stepFrom, stepTo);
             if (stepNodeId == null) {
               blockedSteps[si] = true;
               pathHasBlockedStep = true;
               ja_log('[FAR-TURNS] Step ' + si + ' blocked: no connecting node', 3);
               continue;
             }
-            var stepNode = sdk.DataModel.Nodes.getById({ nodeId: stepNodeId });
+            let stepNode = await sdk.DataModel.Nodes.getById({ nodeId: stepNodeId });
             if (stepNode == null) {
               blockedSteps[si] = true;
               pathHasBlockedStep = true;
               ja_log('[FAR-TURNS] Step ' + si + ' blocked: stepNode is null', 3);
             } else {
-              var isAllowed = ja_is_turn_allowed(stepFrom, stepNode, stepTo);
+              let isAllowed = await ja_is_turn_allowed(stepFrom, stepNode, stepTo);
               if (!isAllowed) {
                 blockedSteps[si] = true;
                 pathHasBlockedStep = true;
@@ -4196,12 +4225,12 @@
 
               // For fallback turns on final step: check JB turn instructions at entry node
               // JB turn instructions are stored at the first node inside the JB (toNodeId of entry segment)
-              var isFinalStep = si === pathSegs.length - 2;
+              let isFinalStep = si === pathSegs.length - 2;
               if (isFallbackJBTurn && isFinalStep) {
                 // Entry node is toNodeId of the entry segment (where it crosses INTO JB)
-                var entryNodeId = fromSeg.toNodeId;
-                var jbTurnsAtEntry = sdk.DataModel.Turns.getTurnsThroughNode({ nodeId: entryNodeId });
-                var hasJBRestriction = jbTurnsAtEntry.some(function (t) {
+                let entryNodeId = fromSeg.toNodeId;
+                let jbTurnsAtEntry = await sdk.DataModel.Turns.getTurnsThroughNode({ nodeId: entryNodeId });
+                let hasJBRestriction = jbTurnsAtEntry.some(function (t) {
                   // Check if this turn matches our path AND has a restriction
                   return t.fromSegmentId === turn.fromSegmentId && t.toSegmentId === turn.toSegmentId && (!t.isAllowed || t.instructionOpCode !== null);
                 });
@@ -4215,7 +4244,7 @@
           }
           // If ANY intermediate step is blocked, mark path as restricted but continue to draw gray marker
           if (pathHasBlockedStep) {
-            var turnTypeStr = turn.isJunctionBoxTurn ? 'JB' : 'fallback JB';
+            let turnTypeStr = turn.isJunctionBoxTurn ? 'JB' : 'fallback JB';
             ja_log('[FAR-TURNS] ' + turnTypeStr + ' turn ' + turn.id + ' restricted: internal node restriction blocks this path', 3);
             isPathRestricted = true;
           }
@@ -4227,14 +4256,14 @@
         // through the path. The final marker will display the total heading change
         // (sum of all intermediate turns), not just the final step's local angle.
         // This is more robust for non-parallel/irregular geometries.
-        var isUTurnPath = turn.instructionOpCode === 'UTURN';
-        var uTurnAccumulatedAngle = 0;
+        let isUTurnPath = turn.instructionOpCode === 'UTURN';
+        let uTurnAccumulatedAngle = 0;
 
         // Loop through each step and draw markers
-        for (var stepIndex = 0; stepIndex < pathSegs.length - 1; stepIndex++) {
-          var stepFrom = pathSegs[stepIndex];
-          var stepTo = pathSegs[stepIndex + 1];
-          var isFinalStep = stepIndex === pathSegs.length - 2;
+        for (let stepIndex = 0; stepIndex < pathSegs.length - 1; stepIndex++) {
+          let stepFrom = pathSegs[stepIndex];
+          let stepTo = pathSegs[stepIndex + 1];
+          let isFinalStep = stepIndex === pathSegs.length - 2;
 
           // Skip blocked steps (JB only)
           if (blockedSteps[stepIndex]) {
@@ -4243,26 +4272,26 @@
           }
 
           // Get connecting node for this step
-          var stepConnectingNodeId = ja_get_connecting_node(stepFrom, stepTo);
+          let stepConnectingNodeId = ja_get_connecting_node(stepFrom, stepTo);
           if (stepConnectingNodeId == null) {
             ja_log('[FAR-TURNS] Step ' + stepIndex + ': no connecting node', 3);
             continue;
           }
-          var stepConnectingNode = sdk.DataModel.Nodes.getById({ nodeId: stepConnectingNodeId });
+          let stepConnectingNode = await sdk.DataModel.Nodes.getById({ nodeId: stepConnectingNodeId });
           if (stepConnectingNode == null) {
             ja_log('[FAR-TURNS] Step ' + stepIndex + ': connecting node not found', 3);
             continue;
           }
 
           // Calculate angle at this step's connecting node
-          var stepInAngle = ja_getAngle(stepConnectingNodeId, stepFrom);
-          var stepOutAngle = ja_getAngle(stepConnectingNodeId, stepTo);
+          let stepInAngle = ja_getAngle(stepConnectingNodeId, stepFrom);
+          let stepOutAngle = ja_getAngle(stepConnectingNodeId, stepTo);
           if (stepInAngle == null || stepOutAngle == null) {
             ja_log('[FAR-TURNS] Step ' + stepIndex + ': could not compute angles', 3);
             continue;
           }
 
-          var stepAngle = ja_angle_diff(stepInAngle, stepOutAngle, false);
+          let stepAngle = ja_angle_diff(stepInAngle, stepOutAngle, false);
 
           // Accumulate for U-TURN total (regardless of whether this step is drawn)
           if (isUTurnPath) {
@@ -4283,7 +4312,7 @@
             // Skip if another path already drew this node+angle pair
             // Multiple paths may traverse the same median segment pair (e.g., A→M1→B and C→M1→B).
             // We only need to show the marker once.
-            var stepKey = stepConnectingNodeId + '_' + ja_round(Math.abs(stepAngle));
+            let stepKey = stepConnectingNodeId + '_' + ja_round(Math.abs(stepAngle));
             if (drawnIntermediateSteps[stepKey]) {
               ja_log('[FAR-TURNS] Skip step ' + stepIndex + ' (already drawn)', 4);
               continue;
@@ -4292,26 +4321,26 @@
           }
 
           // Determine marker type
-          var stepMarkerType;
+          let stepMarkerType;
           if (isFinalStep) {
             // FINAL STEP: apply turn.instructionOpCode override and check exit restriction
-            stepMarkerType = ja_getOption('guess') ? ja_get_final_step_type(turn, stepConnectingNode, lastPathSegId, lastPathSeg, toSeg, stepAngle) : ja_routing_type.TURN;
+            stepMarkerType = ja_getOption('guess') ? await ja_get_final_step_type(turn, stepConnectingNode, lastPathSegId, lastPathSeg, toSeg, stepAngle) : ja_routing_type.TURN;
           } else {
             // INTERMEDIATE STEP: use full routing instruction logic to match local turn colors
             // Build angles array for this node (all connected segments with their bearings)
-            var stepAngles = [];
-            stepConnectingNode.connectedSegmentIds.forEach(function (connSegId) {
-              var connSeg = sdk.DataModel.Segments.getById({ segmentId: connSegId });
+            let stepAngles = [];
+            for (const connSegId of (stepConnectingNode.connectedSegmentIds)) {
+              let connSeg = await sdk.DataModel.Segments.getById({ segmentId: connSegId });
               if (connSeg) {
-                var connBearing = ja_getAngle(stepConnectingNodeId, connSeg);
+                let connBearing = ja_getAngle(stepConnectingNodeId, connSeg);
                 if (connBearing != null) {
                   stepAngles.push([connBearing, connSegId, false]);
                 }
               }
-            });
+            };
             // Apply full routing instruction logic, matching regular departure-mode turns
             // Pass false to suppress "Turn blocked" logs since they're redundant with on-demand evaluation
-            stepMarkerType = ja_getOption('guess') ? ja_guess_routing_instruction(stepConnectingNode, stepFrom.id, stepTo.id, stepAngles, false) : ja_routing_type.TURN;
+            stepMarkerType = ja_getOption('guess') ? await ja_guess_routing_instruction(stepConnectingNode, stepFrom.id, stepTo.id, stepAngles, false) : ja_routing_type.TURN;
           }
 
           // If path is restricted (JB turn level or intermediate node), override to NO_TURN (gray marker)
@@ -4321,22 +4350,22 @@
           }
 
           // Determine marker placement anchor
-          var stepMarkerAnchor = stepConnectingNode;
-          var stepExitBearing = stepOutAngle;
+          let stepMarkerAnchor = stepConnectingNode;
+          let stepExitBearing = stepOutAngle;
 
           // For final step, place at JB boundary crossing (not at node) if it's a JB or fallback JB turn
           // This applies to:
           // A) Turns with isJunctionBoxTurn flag (normal SDK behavior)
           // B) Fallback turns from getAllPossibleTurns() that cross JB boundaries
           //    (these have segmentPath but not the JB flag set)
-          var shouldRepositionToBoundary = isFinalStep && (turn.isJunctionBoxTurn || isFallbackJBTurn);
+          let shouldRepositionToBoundary = isFinalStep && (turn.isJunctionBoxTurn || isFallbackJBTurn);
 
           if (shouldRepositionToBoundary) {
-            var bigJunction = null;
-            var firstPathSegId = turn.segmentPath[0];
+            let bigJunction = null;
+            let firstPathSegId = turn.segmentPath[0];
 
             // Find the BigJunction containing the first path segment (median segment)
-            for (var bji = 0; bji < allBigJunctions.length; bji++) {
+            for (let bji = 0; bji < allBigJunctions.length; bji++) {
               if (allBigJunctions[bji].segmentIds.indexOf(firstPathSegId) !== -1) {
                 bigJunction = allBigJunctions[bji];
                 break;
@@ -4344,8 +4373,8 @@
             }
 
             if (bigJunction != null) {
-              var bjPolygon = turf.polygon(bigJunction.geometry.coordinates);
-              var closestPt = ja_find_closest_bj_intersection(toSeg, bjPolygon, stepConnectingNode);
+              let bjPolygon = turf.polygon(bigJunction.geometry.coordinates);
+              let closestPt = ja_find_closest_bj_intersection(toSeg, bjPolygon, stepConnectingNode);
               if (closestPt !== null) {
                 stepMarkerAnchor = { geometry: closestPt.geometry };
                 ja_log('[FAR-TURNS] Step ' + stepIndex + ': repositioned to JB boundary (isFallback=' + isFallbackJBTurn + ')', 2);
@@ -4354,23 +4383,23 @@
           }
 
           // Compute label distance corrected for latitude
-          var stepJaLd = ja_corrected_ld(ja_label_distance, stepMarkerAnchor.geometry.coordinates);
+          let stepJaLd = ja_corrected_ld(ja_label_distance, stepMarkerAnchor.geometry.coordinates);
 
           // Apply extra-space multiplier for visibility
-          var stepExtraSpace = ja_compute_extra_space(stepAngle, stepExitBearing);
+          let stepExtraSpace = ja_compute_extra_space(stepAngle, stepExitBearing);
 
           // CHECK FOR LOCAL TURN MARKER CONFLICT
           // If a local turn at this node targets the same direction, move this far-turn marker farther out
-          var hasLocalConflict = ja_local_markers_by_node[stepConnectingNodeId] &&
+          let hasLocalConflict = ja_local_markers_by_node[stepConnectingNodeId] &&
                                  ja_local_markers_by_node[stepConnectingNodeId].some(function(ltMarker) {
                                    return ja_markers_target_same_direction(stepExitBearing, ltMarker.bearing, 30);
                                  });
 
           // Check if we repositioned to JB boundary (stepMarkerAnchor !== stepConnectingNode)
-          var isAtBoundary = stepMarkerAnchor !== stepConnectingNode;
+          let isAtBoundary = stepMarkerAnchor !== stepConnectingNode;
 
           // Determine distance multiplier: prioritize boundary distance, then local conflict distance
-          var stepDistanceMultiplier = stepExtraSpace;
+          let stepDistanceMultiplier = stepExtraSpace;
           if (isAtBoundary) {
             // At JB boundary: use larger distance to avoid overlapping with WME turn restriction arrows
             stepDistanceMultiplier = 2.5;
@@ -4385,14 +4414,14 @@
           }
 
           // Calculate marker position
-          var stepPoint = turf.destination(turf.point(stepMarkerAnchor.geometry.coordinates), (stepDistanceMultiplier * stepJaLd) / 1000, ja_math_to_compass(stepExitBearing)).geometry;
+          let stepPoint = turf.destination(turf.point(stepMarkerAnchor.geometry.coordinates), (stepDistanceMultiplier * stepJaLd) / 1000, ja_math_to_compass(stepExitBearing)).geometry;
 
           // Determine marker shape: round for intermediate, square for final
-          var stepIsSquareMarker = isFinalStep;
+          let stepIsSquareMarker = isFinalStep;
 
           // For U-TURN paths on final step, use accumulated total angle instead of local step angle
-          var angleToDisplay = stepAngle;
-          var angleLogDetail = '';
+          let angleToDisplay = stepAngle;
+          let angleLogDetail = '';
           if (isUTurnPath && isFinalStep) {
             angleToDisplay = uTurnAccumulatedAngle;
             angleLogDetail = ' (U-TURN: ' + uTurnAccumulatedAngle.toFixed(1) + '° accumulated)';
@@ -4401,7 +4430,7 @@
           ja_log('[FAR-TURNS] Step ' + stepIndex + ': angle=' + angleToDisplay.toFixed(1) + '° type=' + stepMarkerType + angleLogDetail, 2);
 
           // Draw the marker (isFarTurn=true, isSquareMarker=stepIsSquareMarker)
-          ja_draw_marker(stepPoint, stepMarkerAnchor, stepJaLd, angleToDisplay, stepExitBearing, true, stepMarkerType, true, stepIsSquareMarker);
+          await ja_draw_marker(stepPoint, stepMarkerAnchor, stepJaLd, angleToDisplay, stepExitBearing, true, stepMarkerType, true, stepIsSquareMarker);
 
           // Record this far-turn marker for local turn conflict detection
           if (!ja_far_turn_bearings_by_node[stepConnectingNodeId]) {
@@ -4409,8 +4438,8 @@
           }
           ja_far_turn_bearings_by_node[stepConnectingNodeId].push({ bearing: stepExitBearing, distance: stepDistanceMultiplier * stepJaLd });
         }
-      });
-    });
+      };
+    };
   }
 
   // ── End far turn support ──────────────────────────────────────────────────────────────────────
@@ -4535,7 +4564,7 @@
    * @param {HTMLInputElement|HTMLSelectElement} e - The DOM element that fired the `change`
    *   event (passed as `this` from the inline `onchange` handler in `setupHtml`).
    */
-  var ja_onchange = function (e) {
+  var ja_onchange = async function (e) {
     var applyPending = false;
     var settingName = Object.getOwnPropertyNames(ja_settings).filter(function (a) {
       ja_log(ja_settings[a], 4);
@@ -4621,7 +4650,7 @@
           // Enable: only start if layer is visible; otherwise just set flag and wait for layer to be shown
           if (ja_layer_visible) {
             ja_continuous_mode = true;
-            ja_start_continuous_scan();
+            await ja_start_continuous_scan();
             ja_log('Continuous scanning enabled. Markers persist until segment edits.', 2);
           } else {
             ja_continuous_mode = false;
@@ -4783,7 +4812,10 @@
       });
     }
     // Style driven by ja_build_style_context() closures — recalculate refreshes colors.
-    ja_calculate_real();
+    // ja_apply is sync (called from many sync sites), so the async redraw is fired and its errors logged.
+    ja_calculate_real().catch(function (e) {
+      ja_log('ja_calculate_real failed: ' + (e && e.message ? e.message : e), 1);
+    });
     ja_log(ja_options, 4);
 
     // PHASE 4: Initialize Continuous Scanning if enabled AND layer is visible
@@ -4792,7 +4824,7 @@
       ja_continuous_mode = true;
       ja_log('Continuous scanning enabled on startup', 2);
       // Start the first scan after a brief delay to ensure map is ready
-      setTimeout(() => ja_start_continuous_scan(), 500);
+      setTimeout(async () => await ja_start_continuous_scan(), 500);
     } else {
       ja_continuous_mode = false;
       if (!ja_layer_visible) {
@@ -4854,13 +4886,15 @@
       this.cancel();
       var ja_calculation_timer_self = this;
       this.timeoutID = setTimeout(function () {
-        ja_calculation_timer_self.calculate();
+        ja_calculation_timer_self.calculate().catch(function (e) {
+          ja_log('ja_calculate_real failed: ' + (e && e.message ? e.message : e), 1);
+        });
       }, 200);
     },
 
-    calculate: function () {
-      ja_calculate_real();
+    calculate: async function () {
       delete this.timeoutID;
+      await ja_calculate_real();
     },
 
     cancel: function () {
@@ -5638,6 +5672,7 @@
   sdk = await bootstrap(
     /** @type {BootstrapArgs} */ ({
       scriptUpdateMonitor: { downloadUrl: DOWNLOAD_URL },
+      mode: 'async',
     }),
   );
 
@@ -5751,8 +5786,8 @@
         opt.textContent = ja_getMessage(setting.options[i]);
         select.appendChild(opt);
       }
-      select.onchange = function () {
-        ja_onchange(this);
+      select.onchange = async function () {
+        await ja_onchange(this);
       };
       return select;
     }
@@ -5765,8 +5800,8 @@
       var input = document.createElement('input');
       input.type = 'checkbox';
       input.id = setting.elementId;
-      input.onchange = function () {
-        ja_onchange(this);
+      input.onchange = async function () {
+        await ja_onchange(this);
       };
       var slider = document.createElement('span');
       slider.className = 'ja-toggle-slider';
@@ -5783,8 +5818,8 @@
       input.id = setting.elementId;
       input.min = setting.min;
       input.max = setting.max;
-      input.onchange = function () {
-        ja_onchange(this);
+      input.onchange = async function () {
+        await ja_onchange(this);
       };
       return input;
     }
@@ -5795,8 +5830,8 @@
       var input = document.createElement('input');
       input.type = 'color';
       input.id = setting.elementId;
-      input.onchange = function () {
-        ja_onchange(this);
+      input.onchange = async function () {
+        await ja_onchange(this);
       };
       return input;
     }
@@ -5912,9 +5947,9 @@
     // ── Event registration ────────────────────────────────────────────
     sdk.Events.on({
       eventName: 'wme-selection-changed',
-      eventHandler: function () {
+      eventHandler: async function () {
         // Handle drag-time polling: enable when segment selected, disable otherwise
-        var selection = sdk.Editing.getSelection();
+        var selection = await sdk.Editing.getSelection();
 
         if (selection && selection.objectType === 'segment' && selection.ids && selection.ids.length > 0) {
           // Segment selected: enable polling for real-time updates during drag
@@ -5934,41 +5969,41 @@
         }
 
         // Call original handler to render on-demand markers
-        testSelectedItem();
+        await testSelectedItem();
       },
     });
 
-    sdk.Events.trackDataModelEvents({ dataModelName: 'segments' });
+    await sdk.Events.trackDataModelEvents({ dataModelName: 'segments' });
     sdk.Events.on({
       eventName: 'wme-data-model-objects-changed',
-      eventHandler: function (payload) {
-        if (payload.dataModelName === 'segments' && hasSelection()) {
+      eventHandler: async function (payload) {
+        if (payload.dataModelName === 'segments' && await hasSelection()) {
           ja_calculate();
         }
       },
     });
     sdk.Events.on({
       eventName: 'wme-data-model-objects-removed',
-      eventHandler: function (payload) {
-        if (payload.dataModelName === 'segments' && hasSelection()) {
+      eventHandler: async function (payload) {
+        if (payload.dataModelName === 'segments' && await hasSelection()) {
           ja_calculate();
         }
       },
     });
 
-    sdk.Events.trackDataModelEvents({ dataModelName: 'nodes' });
+    await sdk.Events.trackDataModelEvents({ dataModelName: 'nodes' });
     sdk.Events.on({
       eventName: 'wme-data-model-objects-changed',
-      eventHandler: function (payload) {
-        if (payload.dataModelName === 'nodes' && hasSelection()) {
+      eventHandler: async function (payload) {
+        if (payload.dataModelName === 'nodes' && await hasSelection()) {
           ja_calculate();
         }
       },
     });
     sdk.Events.on({
       eventName: 'wme-data-model-objects-removed',
-      eventHandler: function (payload) {
-        if (payload.dataModelName === 'nodes' && hasSelection()) {
+      eventHandler: async function (payload) {
+        if (payload.dataModelName === 'nodes' && await hasSelection()) {
           ja_calculate();
         }
       },
@@ -5982,19 +6017,19 @@
     //
     // We mirror the same pattern used for 'segments' and 'nodes' above: track the
     // data model and re-run ja_calculate() on change or removal events.
-    sdk.Events.trackDataModelEvents({ dataModelName: 'bigJunctions' });
+    await sdk.Events.trackDataModelEvents({ dataModelName: 'bigJunctions' });
     sdk.Events.on({
       eventName: 'wme-data-model-objects-changed',
-      eventHandler: function (payload) {
-        if (payload.dataModelName === 'bigJunctions' && hasSelection()) {
+      eventHandler: async function (payload) {
+        if (payload.dataModelName === 'bigJunctions' && await hasSelection()) {
           ja_calculate();
         }
       },
     });
     sdk.Events.on({
       eventName: 'wme-data-model-objects-removed',
-      eventHandler: function (payload) {
-        if (payload.dataModelName === 'bigJunctions' && hasSelection()) {
+      eventHandler: async function (payload) {
+        if (payload.dataModelName === 'bigJunctions' && await hasSelection()) {
           ja_calculate();
         }
       },
@@ -6002,25 +6037,25 @@
 
     sdk.Events.on({
       eventName: 'wme-map-zoom-changed',
-      eventHandler: function () {
-        if (hasSelection()) {
+      eventHandler: async function () {
+        if (await hasSelection()) {
           ja_calculate();
         }
       },
     });
     sdk.Events.on({
       eventName: 'wme-map-move-end',
-      eventHandler: function () {
+      eventHandler: async function () {
         // On-demand roundabout overlay: only update if setting is "Always" and something is selected
-        if (ja_options.roundaboutOverlayDisplay === 'rOverAlways' && hasSelection()) {
-          if (sdk.Map.getZoomLevel() >= MIN_ZOOM_LEVEL) {
+        if (ja_options.roundaboutOverlayDisplay === 'rOverAlways' && await hasSelection()) {
+          if (await sdk.Map.getZoomLevel() >= MIN_ZOOM_LEVEL) {
             ja_calculate();
           }
         }
 
         // Continuous scanning: trigger on every pan (if enabled, regardless of selection)
         if (ja_continuous_mode) {
-          ja_debounced_continuous_scan();
+          await ja_debounced_continuous_scan();
         }
       },
     });
@@ -6030,8 +6065,8 @@
     // Only active when a segment is selected; stops automatically when deselected
     sdk.Events.on({
       eventName: 'wme-map-mouse-move',
-      eventHandler: function () {
-        ja_pollSegmentGeometryDuringDrag();
+      eventHandler: async function () {
+        await ja_pollSegmentGeometryDuringDrag();
       },
     });
 
@@ -6039,9 +6074,9 @@
     // Wire up zoom and move events to trigger debounced continuous scans
     sdk.Events.on({
       eventName: 'wme-map-zoom-changed',
-      eventHandler: function () {
+      eventHandler: async function () {
         if (ja_continuous_mode) {
-          ja_debounced_continuous_scan();
+          await ja_debounced_continuous_scan();
         }
       },
     });
@@ -6049,7 +6084,7 @@
     // Track segment/node/turn edits and clear relevant cache entries
     sdk.Events.on({
       eventName: 'wme-data-model-objects-changed',
-      eventHandler: function (payload) {
+      eventHandler: async function (payload) {
         ja_log('*** CONTINUOUS CACHE HANDLER: dataModelName=' + payload.dataModelName + ', ja_continuous_mode=' + ja_continuous_mode + ', hasObjects=' + (payload.objects ? payload.objects.length : 0) + ', payload keys=' + Object.keys(payload).join(','), 2);
 
         if (ja_continuous_mode && (payload.dataModelName === 'segments' || payload.dataModelName === 'nodes' || payload.dataModelName === 'turns')) {
@@ -6105,7 +6140,7 @@
 
           if (nodeIds.length > 0) {
             ja_log('Cache cleared for ' + nodeIds.length + ' affected nodes, triggering debounced scan', 2);
-            ja_debounced_continuous_scan();
+            await ja_debounced_continuous_scan();
           }
         }
       },
@@ -6129,7 +6164,7 @@
     showScriptInfoAlert();
 
     // ── SDK map layer ─────────────────────────────────────────────────
-    sdk.Map.addLayer({
+    await sdk.Map.addLayer({
       layerName: 'junction_angles',
       styleContext: ja_build_style_context(),
       styleRules: ja_build_style_rules(),
@@ -6164,7 +6199,7 @@
      *
      * @param {boolean} enabled - True to show the layer; false to hide it.
      */
-    function ja_setLayerEnabled(enabled) {
+    async function ja_setLayerEnabled(enabled) {
       ja_layer_visible = enabled;
 
       // When layer is disabled, also stop continuous scanning (no point scanning if layer is hidden)
@@ -6182,7 +6217,7 @@
         if (ja_continuous_enabled && !ja_continuous_mode) {
           ja_continuous_mode = true;
           ja_log('Layer enabled. Resuming continuous scanning.', 2);
-          ja_start_continuous_scan();
+          await ja_start_continuous_scan();
         }
       }
 
@@ -6190,8 +6225,8 @@
       if (localStorage) {
         localStorage.setItem('wme_ja_layer_visible', ja_layer_visible ? 'true' : 'false');
       }
-      sdk.Map.setLayerVisibility({ layerName: 'junction_angles', visibility: ja_layer_visible });
-      sdk.LayerSwitcher.setLayerCheckboxChecked({ name: 'Junction Angle Info', isChecked: ja_layer_visible });
+      await sdk.Map.setLayerVisibility({ layerName: 'junction_angles', visibility: ja_layer_visible });
+      await sdk.LayerSwitcher.setLayerCheckboxChecked({ name: 'Junction Angle Info', isChecked: ja_layer_visible });
       var btn = jaTabLabel.querySelector('#ja-power-btn');
       if (btn) {
         btn.style.color = ja_layer_visible ? '#00bd00' : '#ccc';
@@ -6204,12 +6239,12 @@
       var savedVisibility = localStorage.getItem('wme_ja_layer_visible');
       ja_layer_visible = savedVisibility === 'false' ? false : true;
     }
-    sdk.LayerSwitcher.addLayerCheckbox({ name: 'Junction Angle Info', isChecked: ja_layer_visible });
+    await sdk.LayerSwitcher.addLayerCheckbox({ name: 'Junction Angle Info', isChecked: ja_layer_visible });
     sdk.Events.on({
       eventName: 'wme-layer-checkbox-toggled',
-      eventHandler: function (evt) {
+      eventHandler: async function (evt) {
         if (evt.name === 'Junction Angle Info') {
-          ja_setLayerEnabled(evt.checked);
+          await ja_setLayerEnabled(evt.checked);
         }
       },
     });
@@ -6220,9 +6255,9 @@
     // This prevents stale markers when turn data changes in-place.
     sdk.Events.on({
       eventName: 'wme-after-edit',
-      eventHandler: function () {
+      eventHandler: async function () {
         // Check if we have a current selection (segment, node, or multiple items)
-        var currentSel = sdk.Editing.getSelection();
+        var currentSel = await sdk.Editing.getSelection();
         if (currentSel && currentSel.ids && currentSel.ids.length > 0) {
           // Recalculate markers for the currently selected items
           ja_calculate();
@@ -6231,9 +6266,9 @@
     });
 
     // ── Power button click ────────────────────────────────────────────
-    jaTabLabel.addEventListener('click', function (e) {
+    jaTabLabel.addEventListener('click', async function (e) {
       if (e.target && e.target.id === 'ja-power-btn') {
-        ja_setLayerEnabled(!ja_layer_visible);
+        await ja_setLayerEnabled(!ja_layer_visible);
         e.stopPropagation();
       }
     });
@@ -6241,7 +6276,7 @@
     // ── Apply saved visibility state to layer ─────────────────────────
     if (!ja_layer_visible) {
       // If saved state is off, hide the layer immediately
-      sdk.Map.setLayerVisibility({ layerName: 'junction_angles', visibility: false });
+      await sdk.Map.setLayerVisibility({ layerName: 'junction_angles', visibility: false });
       var btn = jaTabLabel.querySelector('#ja-power-btn');
       if (btn) {
         btn.style.color = '#ccc';
@@ -6252,5 +6287,5 @@
     ja_calculate();
   }
 
-  junctionangle_init();
+  await junctionangle_init();
 })();
